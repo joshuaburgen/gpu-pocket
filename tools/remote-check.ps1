@@ -10,5 +10,5 @@ scp "$root/server/Cargo.toml" "$root/server/Cargo.lock" "$root/server/config.exa
 if ($LASTEXITCODE -ne 0) { throw 'Manifest upload failed' }
 scp -r "$root/server/src" "${HostAlias}:/tmp/gpu-pocket-build/"
 if ($LASTEXITCODE -ne 0) { throw 'Source upload failed' }
-ssh $HostAlias 'cd /tmp/gpu-pocket-build; export RUSTUP_HOME=/tmp/gpu-pocket-tools/rustup CARGO_HOME=/tmp/gpu-pocket-tools/cargo; ~/.cargo/bin/cargo fmt -- --check && ~/.cargo/bin/cargo test --locked && ~/.cargo/bin/cargo clippy --all-targets --locked -- -D warnings && ~/.cargo/bin/cargo build --locked'
+ssh $HostAlias 'cd /tmp/gpu-pocket-build; export RUSTUP_HOME=/tmp/gpu-pocket-tools/rustup CARGO_HOME=/tmp/gpu-pocket-tools/cargo; ~/.cargo/bin/cargo fmt -- --check && ~/.cargo/bin/cargo test --locked && ~/.cargo/bin/cargo clippy --all-targets --locked -- -D warnings && ~/.cargo/bin/cargo build --locked && ~/.cargo/bin/cargo build --release --locked'
 if ($LASTEXITCODE -ne 0) { throw 'Rust validation failed' }

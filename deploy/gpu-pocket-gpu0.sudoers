@@ -1,0 +1,3 @@
+# Install root-owned, mode 0440 under /etc/sudoers.d/gpu-pocket-gpu0.
+# This grants GPU0 only; GPU1 remains outside GPU Pocket control.
+joshua ALL=(root) NOPASSWD: /usr/bin/systemctl start gpu-pocket-miner@0.service, /usr/bin/systemctl restart gpu-pocket-miner@0.service, /usr/bin/systemctl stop gpu-pocket-miner@0.service

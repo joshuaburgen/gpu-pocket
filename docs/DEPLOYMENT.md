@@ -98,6 +98,16 @@ sudo systemctl daemon-reload
 
 新服务先进入现有 `research-tun`，再以 `joshua` 执行固定矿工参数。GPU0、GPU1 各自使用独立 systemd 实例与状态文件。它不修改代理订阅、DNS、GPU 驱动或固件。新增矿池由管理员编辑 TOML。
 
+### 仅启用 GPU0 控制
+
+当 GPU1 仍被其他计算任务占用时，可只授权 GPU0 的 systemd 操作。先在开发机按 `tools/remote-check.ps1` 完成 Rust 检查，并生成 release 二进制；将 `gpu-pocket-server`、`deploy/gpu-pocket-miner@.service`、`deploy/gpu-pocket-gpu0.sudoers` 和 `deploy/enable-control-gpu0.sh` 放入服务器同一个暂存目录。确认 GPU0 当前旧矿工已准备好手动切换后，在服务器可信终端以管理员权限执行：
+
+```bash
+sudo bash /path/to/staging/enable-control-gpu0.sh /path/to/staging
+```
+
+该脚本备份 API 配置和二进制，安装矿工 unit 与仅限 GPU0 的 sudoers 规则，启用 API 控制并重启用户级 API；**不会停止现有进程、启动矿工或启用矿工开机启动**。GPU0 旧矿工仍在运行时，App 的新矿工启动会因外部 GPU 进程而返回冲突；先在原监督器会话中停止目标 GPU0，再从 App 启动。GPU1 不在 sudoers 允许范围内，且应保持其正在运行的外部任务。不要将管理员密码或令牌粘贴到聊天中。
+
 systemd 仅在进程退出时重启，不检测“进程仍在但没有新任务／份额”。现有 Python 监督器的保活能力没有被默认继承。需要相同能力时，应先扩展矿工 API 适配器，再决定长期迁移。
 
 ## 4. 代理节点
