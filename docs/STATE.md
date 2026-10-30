@@ -4,7 +4,7 @@
 
 Android 进度：已在本机安装项目内的 JDK 17 和 Android SDK 36，并构建 ARM64 debug APK。构建信息及真机验证状态见下方“验证证据”。
 
-逐卡控制改动进行中：服务端新增 GPU0/GPU1 独立配置、状态与矿工实例 API；手机端增加逐卡算法、矿池、钱包和可选功耗上限表单。生产 API 仍保持 `control_enabled = false`，没有远程部署或启动矿工。当前 Flutter 格式检查、静态分析和测试通过；Rust 变更尚待测试／构建；逐卡版本 APK 尚未重建。
+逐卡控制和自动策略已进入代码并通过开发环境验证：服务端支持 GPU0/GPU1 独立策略、节制／深夜调度、外部进程保护、显存余量停矿及 FCM 设备注册；手机端提供对应策略表单和推送初始化。生产 API 仍保持 `control_enabled = false`，没有远程部署、启动或停止矿工。Firebase 服务账号／客户端参数尚未配置，因此推送没有实测；真实矿工逐卡功耗限制也没有实测。
 
 ## 当前部署
 
@@ -34,14 +34,18 @@ Flutter 端包含监控、控制和连接三个页面，提供自动刷新、后
 
 部署目录提供只读 API unit、GPU0/GPU1 共用的 miner systemd 模板、限定到两张卡实例的 sudoers、Cloudflare Tunnel 和 IPv6 Caddy 示例。当前实际运行的是 tools/install_quick.py 安装的用户级只读服务，尚未安装矿工 unit 或 sudoers。GitHub Actions 检查工作流已写入，尚未在 GitHub 运行。
 
+逐卡自动策略需全局 `control_enabled = true` 并在 App 中逐卡启用；所有策略默认关闭。节制和深夜模式目前只支持 Pearl/SRBMiner。深夜模式忽略功耗／强度、计算占用和外部进程；显存通过 5 秒轮询阈值触发停矿，不是硬上限。节制／日间提醒检测外部任务时不会停止外部进程，只暂停 GPU Pocket 管理的矿工。推送依赖 Firebase 项目及服务账号配置。
+
 ## 验证证据
 
 - Flutter 3.47.9 / Dart 3.13.7：逐卡改动后 `dart format --output=none --set-exit-if-changed lib test`、`flutter analyze` 无问题、3 项测试通过。
 - Rust 1.99.1，Linux x86_64：逐卡改动后 `cargo fmt -- --check`、7 项 `cargo test`、`cargo build` 和 `cargo clippy --all-targets -- -D warnings` 均通过。
+- 自动策略及推送改动后：远端 Rust `cargo fmt -- --check`、11 项 `cargo test --locked`、`cargo clippy --all-targets --locked -- -D warnings` 和 `cargo build --locked` 全部通过；新增北京时间边界、策略默认关闭、推送令牌注册与删除、demo 不查询主机 GPU 进程测试。
+- 自动策略及推送改动后：Flutter format、analyze、3 项测试通过；ARM64 debug APK 构建成功，`mobile/build/app/outputs/flutter-apk/app-debug.apk`（109,353,015 字节）。包名 `com.tongjiwang.gpu_pocket`、最低 SDK 24、目标 SDK 36；Firebase define 未提供，所以此构建未启用推送。
 - `tools/smoke.py` 演示模式 HTTP 测试通过，覆盖鉴权、暂存、冲突拒绝、应用、代理节点选择与停止。
 - 同一脚本的真实只读模式测试通过，从 `2-titan` 的实际 `nvidia-smi` 获得两张 RTX 3080 Ti，采样错误为空；实际写接口均验证为 403。测试服务位于随机回环端口，结束后已退出。
 - Python 工具通过语法编译检查。
-- 2026-10-31：使用本地 JDK 17 / Android SDK 36 重建逐卡版本 ARM64 debug APK 成功，产物 `mobile/build/app/outputs/flutter-apk/app-debug.apk`（107,553,461 字节）。之前已由 `aapt` 确认包名 `com.tongjiwang.gpu_pocket`、最低 SDK 24、目标 SDK 36，并包含互联网权限。当前没有 Android 设备连接到 ADB，尚未安装或真机验证；iOS 未在 macOS / Xcode 编译或真机验证，安全存储的真实设备持久化也尚未验证。
+- 当前没有 Android 设备连接到 ADB，尚未安装或真机验证；iOS 未在 macOS / Xcode 编译或真机验证，安全存储的真实设备持久化也尚未验证。
 
 真实矿工启停、算法／钱包切换及 Mihomo 写操作尚未在生产环境执行。自动测试中的写入只作用于临时演示服务。不要将接口实现与测试通过理解为生产接管已完成。
 
@@ -53,10 +57,11 @@ Flutter 端包含监控、控制和连接三个页面，提供自动刷新、后
 
 ## 待落地事项
 
-1. 将 debug APK 安装到实际 Android 手机，在蜂窝和 Wi-Fi 网络验证连接与安全存储。
-2. 验证逐 GPU 服务端改动和新 APK；审核目标 GPU 接管，人工停止对应旧监督器后才启用控制。当前公开接口始终为只读。
-3. 按需加入矿工算力、份额、无任务监测。现有 Python 监督器的完整保活逻辑未迁移，新矿工服务模板只有 systemd 退出重启。
-4. Quick Tunnel 重启后地址可能变化，需要重新导出连接信息并更新 App。尚未重启整机验证开机启动。
+1. ADB 当前未列出手机；启用 USB 调试、授权电脑后再安装 APK 并验证真机连接、安全存储及通知权限。
+2. 需要 Firebase 客户端参数和服务端服务账号后重新构建 APK，并测试实际 FCM 通知；推送凭据不得进入 Git。
+3. 生产 API 仍为只读。逐卡接管需审核 GPU 分配、现场人工停止旧监督器后才启用控制；真实矿工功耗参数和自动模式尚未在生产 GPU 上实测，不能未经授权自行变更现有任务。
+4. 按需加入矿工算力、份额、无任务监测。现有 Python 监督器的完整保活逻辑未迁移，新矿工服务模板只有 systemd 退出重启。
+5. Quick Tunnel 重启后地址可能变化，需要重新导出连接信息并更新 App。尚未重启整机验证开机启动。
 
 ## 临时环境
 

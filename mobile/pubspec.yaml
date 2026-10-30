@@ -5,6 +5,8 @@ version: 0.1.0+1
 environment:
   sdk: '>=3.10.0 <4.0.0'
 dependencies:
+  firebase_core: ^5.1.0
+  firebase_messaging: ^17.0.1
   flutter:
     sdk: flutter
   flutter_secure_storage: ^11.2.0

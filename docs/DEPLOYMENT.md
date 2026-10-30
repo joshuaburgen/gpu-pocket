@@ -42,6 +42,25 @@ sudo journalctl -u gpu-pocket-api.service -n 30 --no-pager
 
 此时保持 `control_enabled = false`。默认只监听 `127.0.0.1:8787`。监控两张卡不需要 sudo。开发机可用 `ssh -N -L 8787:127.0.0.1:8787 2-titan` 访问远端回环接口。未带令牌应返回 401；正确令牌请求 `/api/v1/status` 应显示 `demo: false` 与真实数据。
 
+### Firebase 手机推送（可选）
+
+在 Firebase Console 创建项目并登记 Android 应用，包名为 `com.tongjiwang.gpu_pocket`。从项目设置取得 `project_id`、`messagingSenderId`、Web API key 和 Android App ID。构建手机端时，将它们作为 `GPU_POCKET_FCM_PROJECT_ID`、`GPU_POCKET_FCM_SENDER_ID`、`GPU_POCKET_FCM_API_KEY`、`GPU_POCKET_FCM_APP_ID` 的 Dart define 提供（见 [Android 构建文档](ANDROID.md)）。这些客户端参数不是服务账号私钥。
+
+在 Firebase 启用 Cloud Messaging API，并创建具备 Firebase Cloud Messaging API 发送权限的服务账号。将下载的 JSON 通过可信管理通道放到服务器的 `/etc/gpu-pocket/`，不可放进仓库、App 或普通日志。设置所有者和权限后，在 `/etc/gpu-pocket/api.env` 添加：
+
+```ini
+GPU_POCKET_FCM_CREDENTIALS=/etc/gpu-pocket/firebase-service-account.json
+```
+
+```bash
+sudo chown root:joshua /etc/gpu-pocket/firebase-service-account.json
+sudo chmod 0640 /etc/gpu-pocket/firebase-service-account.json
+sudo chmod 0600 /etc/gpu-pocket/api.env
+sudo systemctl restart gpu-pocket-api.service
+```
+
+设备连接 API 后会申请通知权限并注册 FCM 令牌。`/var/lib/gpu-pocket/push-tokens.json` 由服务以权限 `0600` 保存；用户删除 App 连接时，客户端会尝试注销自己的令牌。状态中的 `push_configured` 仅表示服务账号文件存在，不代表 Google 已验证凭据或推送已成功；需查看 API 日志并执行实际手机通知验收。未配置 Firebase 时，矿工策略仍可工作，但推送无法投递。
+
 ## 2. HTTPS 入口
 
 先修复主机 DNS，再按 [Cloudflare 官方文档](https://developers.cloudflare.com/tunnel/get-started/) 安装 cloudflared、创建命名隧道与域名。参考 `deploy/cloudflared.example.yml`，将域名仅映射到 `http://127.0.0.1:8787`。样例采用 HTTP/2；本次仅验证了 TCP 7844，未验证 QUIC。无需给服务器开放 API 8787 入站。

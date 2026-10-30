@@ -69,6 +69,14 @@ pub async fn collect() -> Result<Vec<Gpu>> {
 }
 
 pub async fn ensure_gpu_owned(gpu_id: u32) -> Result<()> {
+    let unmanaged = unmanaged_compute_pids(gpu_id).await?;
+    if let Some(pid) = unmanaged.first() {
+        bail!("GPU{gpu_id} is occupied by unmanaged PID {pid}; stop the old supervisor manually before takeover");
+    }
+    Ok(())
+}
+
+pub async fn unmanaged_compute_pids(gpu_id: u32) -> Result<Vec<u32>> {
     let gpus = collect().await?;
     let gpu = gpus
         .iter()
@@ -83,7 +91,11 @@ pub async fn ensure_gpu_owned(gpu_id: u32) -> Result<()> {
     )
     .await?;
     let expected_service = format!("gpu-pocket-miner@{gpu_id}.service");
+    let mut unmanaged = Vec::new();
     for line in processes.lines() {
+        if line.trim().is_empty() || line.contains("No running processes") {
+            continue;
+        }
         let Some((uuid, pid)) = line.split_once(',') else {
             bail!("unrecognized GPU process row");
         };
@@ -101,10 +113,10 @@ pub async fn ensure_gpu_owned(gpu_id: u32) -> Result<()> {
                 .split('/')
                 .any(|c| c == expected_service)
         }) {
-            bail!("GPU{gpu_id} is occupied by unmanaged PID {pid}; stop the old supervisor manually before takeover");
+            unmanaged.push(pid);
         }
     }
-    Ok(())
+    Ok(unmanaged)
 }
 
 pub fn demo() -> Vec<Gpu> {

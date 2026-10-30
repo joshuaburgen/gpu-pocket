@@ -50,6 +50,58 @@ pub struct Selection {
     pub revision: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GpuPolicy {
+    pub gpu_id: u32,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub throttle_enabled: bool,
+    #[serde(default)]
+    pub night_mode_enabled: bool,
+    #[serde(default)]
+    pub external_task_monitor: bool,
+    #[serde(default = "default_memory_floor")]
+    pub min_free_memory_mib: u32,
+    #[serde(default)]
+    pub power_limit_w: Option<u32>,
+    #[serde(default = "default_intensity")]
+    pub intensity: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuMode {
+    #[default]
+    Normal,
+    Throttle,
+    Night,
+}
+
+fn default_memory_floor() -> u32 {
+    2048
+}
+
+fn default_intensity() -> u32 {
+    20
+}
+
+impl GpuPolicy {
+    pub fn new(gpu_id: u32) -> Self {
+        Self {
+            gpu_id,
+            enabled: false,
+            throttle_enabled: false,
+            night_mode_enabled: false,
+            external_task_monitor: false,
+            min_free_memory_mib: default_memory_floor(),
+            power_limit_w: None,
+            intensity: default_intensity(),
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let config: Self = toml::from_str(&std::fs::read_to_string(path)?)?;
@@ -136,6 +188,10 @@ impl Config {
     }
 
     pub fn save_selection(&self, name: &str, selection: &Selection) -> Result<()> {
+        self.save_json(name, selection)
+    }
+
+    fn save_json<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
         std::fs::create_dir_all(&self.state_dir)?;
         let temp = self.state_dir.join(format!(".{name}.tmp"));
         let mut options = std::fs::OpenOptions::new();
@@ -147,7 +203,7 @@ impl Config {
         }
         use std::io::Write;
         let mut file = options.open(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(selection)?)?;
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
         file.sync_all()?;
         std::fs::rename(temp, self.state_dir.join(name))?;
         Ok(())
@@ -171,5 +227,33 @@ impl Config {
             format!("gpu{}-{name}.json", selection.gpu_id)
         };
         self.save_selection(&file, selection)
+    }
+
+    pub fn read_gpu_policy(&self, gpu_id: u32) -> Result<GpuPolicy> {
+        let file = self.state_dir.join(format!("gpu{gpu_id}-policy.json"));
+        if !file.exists() {
+            return Ok(GpuPolicy::new(gpu_id));
+        }
+        let policy: GpuPolicy = serde_json::from_slice(&std::fs::read(file)?)?;
+        if policy.gpu_id != gpu_id {
+            bail!("policy GPU id does not match its file");
+        }
+        Ok(policy)
+    }
+
+    pub fn save_gpu_policy(&self, policy: &GpuPolicy) -> Result<()> {
+        self.save_json(&format!("gpu{}-policy.json", policy.gpu_id), policy)
+    }
+
+    pub fn read_gpu_mode(&self, gpu_id: u32) -> Result<GpuMode> {
+        let file = self.state_dir.join(format!("gpu{gpu_id}-mode.json"));
+        if !file.exists() {
+            return Ok(GpuMode::Normal);
+        }
+        Ok(serde_json::from_slice(&std::fs::read(file)?)?)
+    }
+
+    pub fn save_gpu_mode(&self, gpu_id: u32, mode: GpuMode) -> Result<()> {
+        self.save_json(&format!("gpu{gpu_id}-mode.json"), &mode)
     }
 }

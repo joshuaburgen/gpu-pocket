@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -18,6 +20,23 @@ class _GpuDraft {
   void dispose() {
     wallet.dispose();
     powerLimit.dispose();
+  }
+}
+
+class _GpuPolicyDraft {
+  bool enabled = false;
+  bool throttleEnabled = false;
+  bool nightModeEnabled = false;
+  bool externalTaskMonitor = false;
+  final minFreeMemory = TextEditingController(text: '2048');
+  final powerLimit = TextEditingController();
+  final intensity = TextEditingController(text: '20');
+  bool dirty = false;
+
+  void dispose() {
+    minFreeMemory.dispose();
+    powerLimit.dispose();
+    intensity.dispose();
   }
 }
 
@@ -53,9 +72,13 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
   final _url = TextEditingController();
   final _token = TextEditingController();
   final Map<int, _GpuDraft> _gpuDrafts = {};
+  final Map<int, _GpuPolicyDraft> _policyDrafts = {};
   GpuApi? _api;
   JsonMap? _status, _catalog, _proxy;
-  String? _error, _proxyError;
+  String? _error, _proxyError, _pushStatus;
+  String? _pushToken;
+  StreamSubscription<String>? _pushTokenSubscription;
+  StreamSubscription<RemoteMessage>? _foregroundMessageSubscription;
   DateTime? _lastSuccess;
   Timer? _timer;
   int _tab = 0, _generation = 0;
@@ -109,6 +132,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         next.close();
         throw ApiException('令牌至少需要 32 个字符。');
       }
+      await _unregisterPush(_api);
       _api?.close();
       _api = next;
       _generation++;
@@ -124,6 +148,9 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
           draft.wallet.clear();
           draft.powerLimit.clear();
         }
+        for (final draft in _policyDrafts.values) {
+          draft.dirty = false;
+        }
         _error = null;
       });
       if (persist) {
@@ -131,6 +158,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         await _storage.write(key: 'server_token', value: _token.text.trim());
       }
       await _refresh();
+      await _configurePush(next);
       if (mounted && _status != null) setState(() => _tab = 0);
     } catch (e) {
       if (mounted) setState(() => _error = e.toString());
@@ -154,7 +182,11 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         _error = null;
         _lastSuccess = DateTime.now();
         _syncGpuDrafts();
+        _syncPolicyDrafts();
       });
+      if (_status?['push_configured'] == true) {
+        _pushStatus = '服务端推送已配置';
+      }
       if (_tab == 1) await _loadProxy(api);
     } catch (e) {
       if (mounted && generation == _generation) {
@@ -164,6 +196,104 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       if (mounted && generation == _generation) {
         setState(() => _loading = false);
       }
+    }
+  }
+
+  Future<void> _configurePush(GpuApi api) async {
+    await _pushTokenSubscription?.cancel();
+    await _foregroundMessageSubscription?.cancel();
+    const apiKey = String.fromEnvironment('GPU_POCKET_FCM_API_KEY');
+    const appId = String.fromEnvironment('GPU_POCKET_FCM_APP_ID');
+    const senderId = String.fromEnvironment('GPU_POCKET_FCM_SENDER_ID');
+    const projectId = String.fromEnvironment('GPU_POCKET_FCM_PROJECT_ID');
+    if ([apiKey, appId, senderId, projectId].any((value) => value.isEmpty)) {
+      if (mounted) {
+        setState(() => _pushStatus = '后台推送尚未配置 Firebase 客户端参数');
+      }
+      return;
+    }
+
+    try {
+      if (Firebase.apps.isEmpty) {
+        await Firebase.initializeApp(
+          options: const FirebaseOptions(
+            apiKey: apiKey,
+            appId: appId,
+            messagingSenderId: senderId,
+            projectId: projectId,
+          ),
+        );
+      }
+      final messaging = FirebaseMessaging.instance;
+      final permission = await messaging.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
+      if (permission.authorizationStatus == AuthorizationStatus.denied) {
+        throw ApiException('通知权限已关闭，请在系统设置中允许 GPU Pocket 通知。');
+      }
+      // FCM HTTP v1 targets registration tokens; firebase_messaging 17's
+      // register() stream exposes a Firebase Installation ID instead.
+      // ignore: deprecated_member_use
+      final token = await messaging.getToken();
+      if (token == null) throw ApiException('Firebase 未返回设备推送令牌。');
+      await api.request('PUT', '/api/v1/push/token', {'token': token});
+      _pushToken = token;
+      // ignore: deprecated_member_use
+      _pushTokenSubscription = messaging.onTokenRefresh.listen((token) async {
+        if (!identical(_api, api)) return;
+        try {
+          final previousToken = _pushToken;
+          await api.request('PUT', '/api/v1/push/token', {'token': token});
+          _pushToken = token;
+          if (previousToken != null && previousToken != token) {
+            await api.request('DELETE', '/api/v1/push/token', {
+              'token': previousToken,
+            });
+          }
+        } catch (error) {
+          if (mounted) setState(() => _pushStatus = '设备令牌更新失败：$error');
+        }
+      });
+      _foregroundMessageSubscription = FirebaseMessaging.onMessage.listen((
+        message,
+      ) {
+        final notification = message.notification;
+        if (mounted && notification != null) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                '${notification.title ?? 'GPU Pocket'}：${notification.body ?? ''}',
+              ),
+            ),
+          );
+        }
+      });
+      if (mounted) {
+        setState(() {
+          _pushStatus = _status?['push_configured'] == true
+              ? '后台推送已连接'
+              : '设备已登记，等待服务器配置 Firebase 服务账号';
+        });
+      }
+    } catch (error) {
+      if (mounted) setState(() => _pushStatus = '后台推送初始化失败：$error');
+    }
+  }
+
+  Future<void> _unregisterPush(GpuApi? api) async {
+    await _pushTokenSubscription?.cancel();
+    _pushTokenSubscription = null;
+    await _foregroundMessageSubscription?.cancel();
+    _foregroundMessageSubscription = null;
+    final token = _pushToken;
+    _pushToken = null;
+    if (api == null || token == null) return;
+    try {
+      await api.request('DELETE', '/api/v1/push/token', {'token': token});
+    } catch (error) {
+      if (mounted) setState(() => _pushStatus = '移除服务器推送设备失败：$error');
     }
   }
 
@@ -180,6 +310,32 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       draft.wallet.text = desired?['wallet'] as String? ?? '';
       final power = desired?['power_limit_w'];
       draft.powerLimit.text = power is num ? power.toInt().toString() : '';
+    }
+  }
+
+  void _syncPolicyDrafts() {
+    final policies = (_status?['policies'] as JsonMap?) ?? {};
+    for (final entry in policies.entries) {
+      final gpuId = int.tryParse(entry.key);
+      if (gpuId == null || entry.value is! Map) continue;
+      final draft = _policyDrafts.putIfAbsent(gpuId, _GpuPolicyDraft.new);
+      if (draft.dirty) continue;
+      final policy = (entry.value as JsonMap)['policy'] as JsonMap?;
+      if (policy == null) continue;
+      draft.enabled = policy['enabled'] == true;
+      draft.throttleEnabled = policy['throttle_enabled'] == true;
+      draft.nightModeEnabled = policy['night_mode_enabled'] == true;
+      draft.externalTaskMonitor = policy['external_task_monitor'] == true;
+      final memory = policy['min_free_memory_mib'];
+      draft.minFreeMemory.text = memory is num
+          ? memory.toInt().toString()
+          : '2048';
+      final power = policy['power_limit_w'];
+      draft.powerLimit.text = power is num ? power.toInt().toString() : '';
+      final intensity = policy['intensity'];
+      draft.intensity.text = intensity is num
+          ? intensity.toInt().toString()
+          : '20';
     }
   }
 
@@ -299,6 +455,9 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     _url.dispose();
     _token.dispose();
     for (final draft in _gpuDrafts.values) {
+      draft.dispose();
+    }
+    for (final draft in _policyDrafts.values) {
       draft.dispose();
     }
     super.dispose();
@@ -472,7 +631,11 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       _heading('逐卡控制', '每张 GPU 独立选择算法与功耗上限；暂存后再确认应用。'),
       if (_status?['control_enabled'] != true)
         _notice('服务器当前为只读模式。需在服务端配置中启用控制。', Colors.amber),
-      _notice('节制、深夜、提醒与自动控制尚未启用；当前仅配置逐卡算法和功耗上限。', Colors.white60),
+      _notice(
+        '自动模式仅支持 SRBMiner Pearl：GPU 利用率低于 5% 持续 30 分钟后启动节制模式；深夜模式按北京时间 01:00–08:00 运行。显存通过 2048 MiB 余量监测触发停矿，不是硬上限。',
+        Colors.white60,
+      ),
+      if (_pushStatus != null) _notice(_pushStatus!, Colors.amber),
       for (final gpuId in [0, 1])
         _gpuControlCard(
           gpuId,
@@ -485,6 +648,11 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
 
   Widget _gpuControlCard(int gpuId, JsonMap? control, JsonMap? metrics) {
     final draft = _gpuDrafts.putIfAbsent(gpuId, _GpuDraft.new);
+    final policyDraft = _policyDrafts.putIfAbsent(gpuId, _GpuPolicyDraft.new);
+    final policyData =
+        (_status?['policies'] as JsonMap?)?[gpuId.toString()] as JsonMap?;
+    final policy = policyData?['policy'] as JsonMap?;
+    final runtime = policyData?['runtime'] as JsonMap?;
     final profile = _profiles
         .where((item) => item['id'] == draft.profileId)
         .firstOrNull;
@@ -643,10 +811,163 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                 ),
               ],
             ),
+            const Divider(height: 32),
+            ..._policyControls(
+              gpuId,
+              policyDraft,
+              policy,
+              runtime,
+              draft.profileId,
+              minPower,
+              maxPower,
+            ),
           ],
         ),
       ),
     );
+  }
+
+  List<Widget> _policyControls(
+    int gpuId,
+    _GpuPolicyDraft draft,
+    JsonMap? policy,
+    JsonMap? runtime,
+    String? profileId,
+    num? minPower,
+    num? maxPower,
+  ) {
+    final canSave =
+        _enabled &&
+        draft.dirty &&
+        int.tryParse(draft.minFreeMemory.text) != null &&
+        int.tryParse(draft.intensity.text) != null &&
+        (draft.powerLimit.text.isEmpty ||
+            int.tryParse(draft.powerLimit.text) != null);
+    return [
+      Text(
+        '自动控制 · 当前 ${policyDataMode(policy, runtime)}',
+        style: Theme.of(context).textTheme.titleMedium,
+      ),
+      const SizedBox(height: 6),
+      const Text(
+        '节制模式仅支持 SRBMiner 强度参数（不是 GPU 利用率百分比）；深夜模式忽略功耗、强度、计算占用和外部进程，只按可用显存阈值停矿。显存检查每 5 秒一次，不能保证硬上限。',
+        style: TextStyle(color: Colors.white60),
+      ),
+      if (runtime?['message'] is String)
+        Padding(
+          padding: const EdgeInsets.only(top: 6),
+          child: Text(runtime!['message'] as String),
+        ),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        title: const Text('启用此卡自动控制'),
+        value: draft.enabled,
+        onChanged: _enabled
+            ? (value) => setState(() {
+                draft.enabled = value;
+                draft.dirty = true;
+              })
+            : null,
+      ),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        title: const Text('节制模式：低于 5% 持续 30 分钟后启动'),
+        value: draft.throttleEnabled,
+        onChanged: _enabled
+            ? (value) => setState(() {
+                draft.throttleEnabled = value;
+                draft.dirty = true;
+              })
+            : null,
+      ),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        title: const Text('深夜模式：北京时间 01:00–08:00'),
+        value: draft.nightModeEnabled,
+        onChanged: _enabled
+            ? (value) => setState(() {
+                draft.nightModeEnabled = value;
+                draft.dirty = true;
+              })
+            : null,
+      ),
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        title: const Text('外部计算任务检测与提醒'),
+        value: draft.externalTaskMonitor,
+        onChanged: _enabled
+            ? (value) => setState(() {
+                draft.externalTaskMonitor = value;
+                draft.dirty = true;
+              })
+            : null,
+      ),
+      TextField(
+        controller: draft.powerLimit,
+        enabled: _enabled && minPower != null && maxPower != null,
+        keyboardType: TextInputType.number,
+        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+        decoration: InputDecoration(
+          labelText: '节制模式功耗上限（W，可选）',
+          helperText: minPower != null && maxPower != null
+              ? '允许范围 ${minPower.ceil()}–${maxPower.floor()} W。深夜模式不使用此值。'
+              : '服务器未提供此卡功耗范围，不能设置功耗上限。',
+        ),
+        onChanged: (_) => setState(() => draft.dirty = true),
+      ),
+      const SizedBox(height: 12),
+      TextField(
+        controller: draft.intensity,
+        enabled: _enabled && profileId == 'pearl',
+        keyboardType: TextInputType.number,
+        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+        decoration: const InputDecoration(
+          labelText: 'SRBMiner 节制强度（0–31）',
+          helperText: '仅 Pearl 使用；不是 GPU 利用率百分比。深夜模式忽略。',
+        ),
+        onChanged: (_) => setState(() => draft.dirty = true),
+      ),
+      const SizedBox(height: 12),
+      TextField(
+        controller: draft.minFreeMemory,
+        enabled: _enabled,
+        keyboardType: TextInputType.number,
+        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+        decoration: const InputDecoration(
+          labelText: '最低可用显存（MiB）',
+          helperText: '默认 2048 MiB；低于该值时停止自动模式矿工。',
+        ),
+        onChanged: (_) => setState(() => draft.dirty = true),
+      ),
+      const SizedBox(height: 12),
+      FilledButton.tonal(
+        onPressed: canSave
+            ? () => _mutate((api) async {
+                await api.request('PUT', '/api/v1/gpus/$gpuId/policy', {
+                  'gpu_id': gpuId,
+                  'enabled': draft.enabled,
+                  'throttle_enabled': draft.throttleEnabled,
+                  'night_mode_enabled': draft.nightModeEnabled,
+                  'external_task_monitor': draft.externalTaskMonitor,
+                  'min_free_memory_mib': int.parse(draft.minFreeMemory.text),
+                  'power_limit_w': draft.powerLimit.text.isEmpty
+                      ? null
+                      : int.parse(draft.powerLimit.text),
+                  'intensity': int.parse(draft.intensity.text),
+                });
+                draft.dirty = false;
+              })
+            : null,
+        child: const Text('保存自动控制设置'),
+      ),
+    ];
+  }
+
+  String policyDataMode(JsonMap? policy, JsonMap? runtime) {
+    if (runtime?['memory_blocked'] == true) return '显存保护暂停';
+    if (runtime?['external_task'] == true) return '外部任务保护';
+    if (policy?['enabled'] != true) return '关闭';
+    return '待机 / 自动监控';
   }
 
   List<Widget> _proxyControls() {
@@ -723,6 +1044,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     TextButton(
       onPressed: !_working && !_loading
           ? () async {
+              await _unregisterPush(_api);
               await _storage.delete(key: 'server_url');
               await _storage.delete(key: 'server_token');
               _api?.close();
@@ -732,10 +1054,15 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                 draft.dispose();
               }
               _gpuDrafts.clear();
+              for (final draft in _policyDrafts.values) {
+                draft.dispose();
+              }
+              _policyDrafts.clear();
               if (mounted) {
                 setState(() {
                   _token.clear();
                   _url.clear();
+                  _pushStatus = '服务器连接已删除；需重新连接后配置通知';
                   _status = null;
                   _catalog = null;
                   _proxy = null;

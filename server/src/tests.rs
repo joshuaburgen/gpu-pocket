@@ -20,6 +20,11 @@ fn fixture() -> (App, tempfile::TempDir) {
         mutation: Arc::new(Mutex::new(())),
         demo_active: Arc::new(Mutex::new(BTreeMap::new())),
         demo_node: Arc::new(Mutex::new("DEMO-HK".into())),
+        runtime: Arc::new(Mutex::new(BTreeMap::new())),
+        push: Arc::new(crate::push::PushService::new(
+            dir.path().to_path_buf(),
+            reqwest::Client::new(),
+        )),
         client: reqwest::Client::new(),
     };
     (app, dir)
@@ -53,6 +58,9 @@ async fn all_routes_require_authentication() {
         ("POST", "/api/v1/miner"),
         ("PUT", "/api/v1/gpus/0/selection"),
         ("POST", "/api/v1/gpus/1/miner"),
+        ("GET", "/api/v1/gpus/1/policy"),
+        ("PUT", "/api/v1/gpus/0/policy"),
+        ("PUT", "/api/v1/push/token"),
         ("GET", "/api/v1/proxy"),
         ("PUT", "/api/v1/proxy"),
     ] {
@@ -215,6 +223,152 @@ async fn gpu_scoped_selections_and_services_are_independent() {
     let (_, status) = call(&app, "GET", "/api/v1/status", Value::Null).await;
     assert_eq!(status["gpu_controls"]["0"]["service"], "inactive");
     assert_eq!(status["gpu_controls"]["1"]["service"], "active");
+}
+
+#[tokio::test]
+async fn policies_are_per_gpu_validated_and_disabled_by_default() {
+    let (app, _dir) = fixture();
+    let (_, status) = call(&app, "GET", "/api/v1/status", Value::Null).await;
+    assert_eq!(status["policies"]["0"]["policy"]["enabled"], false);
+    assert_eq!(
+        status["policies"]["1"]["policy"]["min_free_memory_mib"],
+        2048
+    );
+
+    call(
+        &app,
+        "PUT",
+        "/api/v1/gpus/1/selection",
+        json!({
+            "gpu_id":1,
+            "profile_id":"pearl",
+            "pool_id":"sg",
+            "wallet":"test.worker",
+            "revision":0
+        }),
+    )
+    .await;
+    assert_eq!(
+        call(
+            &app,
+            "PUT",
+            "/api/v1/gpus/1/policy",
+            json!({
+                "gpu_id":1,
+                "enabled":true,
+                "throttle_enabled":true,
+                "night_mode_enabled":true,
+                "external_task_monitor":true,
+                "min_free_memory_mib":2048,
+                "power_limit_w":250,
+                "intensity":20
+            })
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &app,
+            "PUT",
+            "/api/v1/gpus/0/policy",
+            json!({
+                "gpu_id":1,
+                "enabled":true,
+                "throttle_enabled":true,
+                "night_mode_enabled":false,
+                "external_task_monitor":false,
+                "min_free_memory_mib":2048,
+                "power_limit_w":250,
+                "intensity":20
+            })
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            &app,
+            "PUT",
+            "/api/v1/gpus/1/policy",
+            json!({
+                "gpu_id":1,
+                "enabled":true,
+                "throttle_enabled":true,
+                "night_mode_enabled":false,
+                "external_task_monitor":false,
+                "min_free_memory_mib":2048,
+                "power_limit_w":250,
+                "intensity":99
+            })
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[test]
+fn beijing_night_schedule_has_inclusive_start_and_exclusive_end() {
+    let beijing = |hour: u64, minute: u64| {
+        let local = hour * 3600 + minute * 60;
+        let utc = (local + 86_400 - 8 * 3600) % 86_400;
+        UNIX_EPOCH + Duration::from_secs(utc)
+    };
+    assert!(!is_china_night(beijing(0, 59)).unwrap());
+    assert!(is_china_night(beijing(1, 0)).unwrap());
+    assert!(is_china_night(beijing(7, 59)).unwrap());
+    assert!(!is_china_night(beijing(8, 0)).unwrap());
+}
+
+#[tokio::test]
+async fn demo_policy_tick_does_not_query_host_gpu_processes() {
+    let (app, _dir) = fixture();
+    app.config
+        .save_gpu_policy(&GpuPolicy {
+            gpu_id: 1,
+            enabled: true,
+            throttle_enabled: false,
+            night_mode_enabled: false,
+            external_task_monitor: true,
+            min_free_memory_mib: 2048,
+            power_limit_w: None,
+            intensity: 20,
+        })
+        .unwrap();
+    policy_tick(&app).await.unwrap();
+    assert_eq!(app.config.read_gpu_mode(1).unwrap(), GpuMode::Normal);
+    assert!(!app.demo_active.lock().await.contains_key(&1));
+}
+
+#[tokio::test]
+async fn push_token_routes_register_deduplicate_and_remove_tokens() {
+    let (app, dir) = fixture();
+    let token = "test-firebase-device-token-with-more-than-32-characters";
+    for _ in 0..2 {
+        assert_eq!(
+            call(&app, "PUT", "/api/v1/push/token", json!({"token":token}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let saved: Vec<String> =
+        serde_json::from_slice(&std::fs::read(dir.path().join("push-tokens.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved, [token]);
+    assert_eq!(
+        call(&app, "DELETE", "/api/v1/push/token", json!({"token":token}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let saved: Vec<String> =
+        serde_json::from_slice(&std::fs::read(dir.path().join("push-tokens.json")).unwrap())
+            .unwrap();
+    assert!(saved.is_empty());
 }
 
 #[tokio::test]

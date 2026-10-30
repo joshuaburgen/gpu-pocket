@@ -28,6 +28,20 @@ $url = (Get-Content .local/connection.json -Raw | ConvertFrom-Json).url
 
 构建脚本仅设置当前进程的环境变量。它关闭 Flutter 遥测，避免本机遥测初始化等待；Flutter 与 Pub 下载使用 Flutter 中国社区镜像。
 
+手机推送为可选功能。先按 [部署文档](DEPLOYMENT.md) 创建 Firebase 项目并登记包名为 `com.tongjiwang.gpu_pocket` 的 Android 应用。取得 Firebase 客户端的 API key、App ID、Sender ID、Project ID 后，将四个值一并传给构建脚本；脚本要求四项全填或全空：
+
+```powershell
+./tools/build_android.ps1 `
+  -JavaHome '你的 JDK 目录' `
+  -DefaultUrl $url `
+  -FcmApiKey 'Firebase Web API key' `
+  -FcmAppId 'Firebase Android App ID' `
+  -FcmSenderId 'Firebase Sender ID' `
+  -FcmProjectId 'Firebase Project ID'
+```
+
+不要把 Firebase 服务账号 JSON 或私钥传给构建脚本；服务账号只安装在 API 服务器上。未提供客户端参数时，App 会显示推送尚未配置，其他监控和控制功能不受影响。
+
 ## 安装和验证
 
 可以把 APK 传到手机后安装，也可以打开 USB 调试、连接电脑并允许这台电脑调试，然后运行：
