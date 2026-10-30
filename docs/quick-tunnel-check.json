@@ -1,0 +1,11 @@
+{
+  "checked_at": "2026-10-30T09:27:31.190166+00:00",
+  "url": "https://federation-privileges-honey-submitting.trycloudflare.com",
+  "anonymous_http": 401,
+  "authenticated_http": 200,
+  "control_http": 403,
+  "gpu_count": 2,
+  "metric_errors": [],
+  "duration_ms": 2672,
+  "result": "PASS"
+}

@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-30",
+  "timezone": "Asia/Shanghai",
+  "network": "computer connected to phone hotspot",
+  "client_ipv6_prefix": "240e:46e:8600:3a0::/64",
+  "tests": {
+    "native_tcp_to_tsinghua_ipv6_443": "connected",
+    "native_tcp_to_server_nontemporary_ipv6_99": "timeout",
+    "native_tcp_to_server_temporary_ipv6_99": "timeout",
+    "client_initiated_ping_to_server": "timeout",
+    "server_initiated_ping_from_nontemporary_ipv6_to_phone": "3 of 3 replies",
+    "server_initiated_ping_from_temporary_ipv6_to_phone": "3 of 3 replies",
+    "quick_tunnel_authenticated_api": 200,
+    "quick_tunnel_anonymous_api": 401,
+    "quick_tunnel_control_api": 403
+  },
+  "server_capture": {
+    "window_start": "2026-10-30T22:32:41+08:00",
+    "duration_seconds": 180,
+    "filter_scope": "server nontemporary IPv6 and phone /64, ICMPv6 or TCP port 99",
+    "packets_captured": 6,
+    "packets_received_by_filter": 6,
+    "packets_dropped_by_kernel": 0,
+    "observed": "3 server-initiated Echo Requests and 3 Echo Replies from phone",
+    "client_initiated_tcp_syn_observed": false,
+    "client_initiated_echo_request_observed": false
+  },
+  "conclusion": "Native hotspot tests exclude the phone browser as the sole cause. No client-initiated probe reached the server capture point; the exact filtering or failure location is not established."
+}

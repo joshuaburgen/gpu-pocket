@@ -1,0 +1,25 @@
+name: Check
+on: [push, pull_request]
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable --profile minimal --component rustfmt,clippy
+      - run: cargo +stable fmt --manifest-path server/Cargo.toml --check
+      - run: cargo +stable test --manifest-path server/Cargo.toml --locked
+      - run: cargo +stable clippy --manifest-path server/Cargo.toml --locked -- -D warnings
+  mobile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+      - run: echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+      - run: flutter pub get
+        working-directory: mobile
+      - run: dart format --output=none --set-exit-if-changed lib test
+        working-directory: mobile
+      - run: flutter analyze
+        working-directory: mobile
+      - run: flutter test
+        working-directory: mobile

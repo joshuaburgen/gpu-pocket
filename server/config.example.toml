@@ -1,0 +1,39 @@
+# Copy to /etc/gpu-pocket/server.toml. Keep production control disabled until takeover.
+listen = "127.0.0.1:8787"
+gpu_root = "/media/new_data3/Tongji-Wang/gpu"
+state_dir = "/var/lib/gpu-pocket"
+control_enabled = false
+
+[[profiles]]
+id = "pearl"
+label = "Pearl · pearlhash / SRBMiner"
+miner = "srb-pearl"
+binary = "research-srb-3-8-0/research-srb"
+
+[[profiles.pools]]
+id = "sg"
+label = "Kryptex Singapore"
+address = "prl-sg.kryptex.network:7048"
+tls = false
+
+[[profiles.pools]]
+id = "hk"
+label = "Kryptex Hong Kong"
+address = "prl-hk.kryptex.network:7048"
+tls = false
+
+[[profiles]]
+id = "octopus"
+label = "NiceHash · OCTOPUS / lolMiner"
+miner = "lol-octopus"
+binary = "research-octopus-1.98a/research-octopus"
+
+[[profiles.pools]]
+id = "nicehash"
+label = "NiceHash Auto TLS"
+address = "octopus.auto.nicehash.com:443"
+tls = true
+
+[proxy]
+endpoint = "http://127.0.0.1:19097"
+group = "RESEARCH_AUTO"

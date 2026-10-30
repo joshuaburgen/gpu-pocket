@@ -1,0 +1,18 @@
+[Unit]
+Description=GPU Pocket managed GPU%i miner inside research-tun
+Requires=research-tun.service
+After=research-tun.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Root enters the existing namespace, then runuser immediately drops privileges.
+ExecStart=/usr/sbin/ip netns exec research-tun /usr/sbin/runuser -u joshua -- /opt/gpu-pocket/gpu-pocket-server miner /etc/gpu-pocket/server.toml %i
+Restart=on-failure
+RestartSec=15
+KillMode=control-group
+TimeoutStopSec=30
+UMask=0077
+
+# Intentionally no Install section: start only through an explicit mobile action.

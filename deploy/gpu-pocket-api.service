@@ -1,0 +1,26 @@
+[Unit]
+Description=GPU Pocket authenticated API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=joshua
+Group=joshua
+EnvironmentFile=/etc/gpu-pocket/api.env
+Environment=RUST_LOG=info
+ExecStart=/opt/gpu-pocket/gpu-pocket-server /etc/gpu-pocket/server.toml
+Restart=on-failure
+RestartSec=5
+UMask=0077
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/gpu-pocket
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

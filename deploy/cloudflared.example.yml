@@ -1,0 +1,8 @@
+# Named tunnel credentials belong outside this repository.
+tunnel: YOUR-TUNNEL-UUID
+credentials-file: /etc/cloudflared/YOUR-TUNNEL-UUID.json
+protocol: http2
+ingress:
+  - hostname: gpu.example.com
+    service: http://127.0.0.1:8787
+  - service: http_status:404

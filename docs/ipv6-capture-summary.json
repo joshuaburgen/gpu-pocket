@@ -1,0 +1,50 @@
+{
+  "timezone": "Asia/Shanghai",
+  "packet_count": 138,
+  "external_probe_window": {
+    "start": "2026-10-30 22:01:51",
+    "end": "2026-10-30 22:02:20",
+    "matching_packets": 0
+  },
+  "clients": [
+    {
+      "label": "computer-control",
+      "prefix": "2001:da8:8002:1bd1::/64",
+      "flags": {
+        "in:S": 2,
+        "out:S.": 2,
+        "in:.": 4,
+        "in:P.": 2,
+        "out:.": 2,
+        "out:P.": 2,
+        "in:F.": 2,
+        "out:F.": 2
+      },
+      "first_syn_to_first_ack_ms_by_connection": [
+        8.184,
+        16.434
+      ]
+    },
+    {
+      "label": "unconfirmed-client-2",
+      "prefix": "2001:da8:8002:1bd1::/64",
+      "flags": {
+        "in:S": 26,
+        "out:S.": 43,
+        "in:.": 12,
+        "in:P.": 8,
+        "out:.": 17,
+        "out:P.": 9,
+        "in:R.": 4,
+        "out:R.": 1
+      },
+      "first_syn_to_first_ack_ms_by_connection": [
+        21035.428,
+        9839.891,
+        31611.045,
+        9514.461,
+        70.077
+      ]
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+# Install root-owned, mode 0440 under /etc/sudoers.d/gpu-pocket.
+# Validate exact binary paths with command -v first.
+joshua ALL=(root) NOPASSWD: /usr/bin/systemctl start gpu-pocket-miner@0.service, /usr/bin/systemctl restart gpu-pocket-miner@0.service, /usr/bin/systemctl stop gpu-pocket-miner@0.service, /usr/bin/systemctl start gpu-pocket-miner@1.service, /usr/bin/systemctl restart gpu-pocket-miner@1.service, /usr/bin/systemctl stop gpu-pocket-miner@1.service

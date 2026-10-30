@@ -1,0 +1,2 @@
+#include "Generated.xcconfig"
+CODE_SIGN_ENTITLEMENTS = Runner/Release.entitlements

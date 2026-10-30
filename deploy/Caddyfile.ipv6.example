@@ -1,0 +1,5 @@
+# AAAA must point to the server's stable global IPv6 address.
+# Open inbound TCP 80/443 only after verifying upstream IPv6 firewall policy.
+gpu.example.com {
+    reverse_proxy 127.0.0.1:8787
+}

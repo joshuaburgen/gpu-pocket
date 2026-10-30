@@ -1,0 +1,179 @@
+{
+  "checked_at": "2026-10-30T09:26:39.680496+00:00",
+  "local_dns": {
+    "region1.v2.argotunnel.com": [
+      "198.41.192.107",
+      "198.41.192.167",
+      "198.41.192.227",
+      "198.41.192.27",
+      "198.41.192.37",
+      "198.41.192.47",
+      "198.41.192.57",
+      "198.41.192.67",
+      "198.41.192.7",
+      "198.41.192.77"
+    ],
+    "region2.v2.argotunnel.com": [
+      "198.41.200.113",
+      "198.41.200.13",
+      "198.41.200.193",
+      "198.41.200.23",
+      "198.41.200.233",
+      "198.41.200.33",
+      "198.41.200.43",
+      "198.41.200.53",
+      "198.41.200.63",
+      "198.41.200.73"
+    ]
+  },
+  "remote": {
+    "addresses": [
+      {
+        "ifindex": 4,
+        "ifname": "tailscale0",
+        "flags": [
+          "POINTOPOINT",
+          "MULTICAST",
+          "NOARP",
+          "UP",
+          "LOWER_UP"
+        ],
+        "mtu": 1280,
+        "operstate": "UNKNOWN",
+        "txqlen": 500,
+        "addr_info": [
+          {
+            "family": "inet6",
+            "local": "fd7a:115c:a1e0::102b:251c",
+            "prefixlen": 128,
+            "scope": "global",
+            "valid_life_time": 4294967295,
+            "preferred_life_time": 4294967295
+          },
+          {}
+        ]
+      },
+      {
+        "ifindex": 5,
+        "ifname": "wlx6c1ff738d2cf",
+        "flags": [
+          "BROADCAST",
+          "MULTICAST",
+          "UP",
+          "LOWER_UP"
+        ],
+        "mtu": 1500,
+        "operstate": "UP",
+        "txqlen": 1000,
+        "addr_info": [
+          {
+            "family": "inet6",
+            "local": "2001:da8:8002:6bd1:fc79:6df9:7150:a2e7",
+            "prefixlen": 64,
+            "scope": "global",
+            "temporary": true,
+            "dynamic": true,
+            "valid_life_time": 596194,
+            "preferred_life_time": 77753
+          },
+          {
+            "family": "inet6",
+            "local": "2001:da8:8002:6bd1:138d:12f8:7ec9:d4c5",
+            "prefixlen": 64,
+            "scope": "global",
+            "temporary": true,
+            "deprecated": true,
+            "dynamic": true,
+            "valid_life_time": 509838,
+            "preferred_life_time": 0
+          },
+          {
+            "family": "inet6",
+            "local": "2001:da8:8002:6bd1:de1c:e91b:33f4:4870",
+            "prefixlen": 64,
+            "scope": "global",
+            "temporary": true,
+            "deprecated": true,
+            "dynamic": true,
+            "valid_life_time": 423481,
+            "preferred_life_time": 0
+          },
+          {
+            "family": "inet6",
+            "local": "2001:da8:8002:6bd1:b0d1:bee3:63ce:ceaa",
+            "prefixlen": 64,
+            "scope": "global",
+            "temporary": true,
+            "deprecated": true,
+            "dynamic": true,
+            "valid_life_time": 337124,
+            "preferred_life_time": 0
+          },
+          {
+            "family": "inet6",
+            "local": "2001:da8:8002:6bd1:5d5d:9bea:1702:6bee",
+            "prefixlen": 64,
+            "scope": "global",
+            "dynamic": true,
+            "mngtmpaddr": true,
+            "noprefixroute": true,
+            "valid_life_time": 2592000,
+            "preferred_life_time": 604800
+          },
+          {}
+        ]
+      }
+    ],
+    "outbound_checks": [
+      {
+        "host": "region1.v2.argotunnel.com",
+        "port": 7844,
+        "tcp": "ok"
+      },
+      {
+        "host": "region2.v2.argotunnel.com",
+        "port": 7844,
+        "tcp": "ok"
+      },
+      {
+        "host": "api.trycloudflare.com",
+        "port": 443,
+        "tcp": "ok"
+      },
+      {
+        "host": "2606:4700:4700::1111",
+        "port": 443,
+        "tcp": "failed",
+        "error": "timed out"
+      },
+      {
+        "host": "198.41.192.107",
+        "port": 7844,
+        "tcp": "ok"
+      },
+      {
+        "host": "198.41.192.167",
+        "port": 7844,
+        "tcp": "ok"
+      },
+      {
+        "host": "198.41.200.113",
+        "port": 7844,
+        "tcp": "ok"
+      },
+      {
+        "host": "198.41.200.13",
+        "port": 7844,
+        "tcp": "ok"
+      }
+    ]
+  },
+  "local_to_server_ipv6": [
+    {
+      "address": "2001:da8:8002:6bd1:5d5d:9bea:1702:6bee",
+      "ssh_port99": "failed",
+      "errno": 10051,
+      "winerror": 10051
+    }
+  ]
+}
