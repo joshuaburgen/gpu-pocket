@@ -208,7 +208,7 @@ async fn cpu_mining_is_independent_and_defaults_to_half_threads() {
 
     let selected = json!({
         "profile_id":"xmr-randomx",
-        "pool_id":"hashvault-ssl",
+        "pool_id":"kryptex-us",
         "wallet":"testWallet.worker",
         "revision":0
     });
@@ -227,7 +227,7 @@ async fn cpu_mining_is_independent_and_defaults_to_half_threads() {
             "/api/v1/cpu/selection",
             json!({
                 "profile_id":"xmr-randomx",
-                "pool_id":"hashvault-ssl",
+                "pool_id":"kryptex-us",
                 "wallet":"testWallet.worker",
                 "threads_percent":101,
                 "revision":1
