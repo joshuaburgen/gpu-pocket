@@ -1,0 +1,2 @@
+# Install root-owned, mode 0440 under /etc/sudoers.d/gpu-pocket-cpu.
+joshua ALL=(root) NOPASSWD: /usr/bin/systemctl start gpu-pocket-cpu.service, /usr/bin/systemctl restart gpu-pocket-cpu.service, /usr/bin/systemctl stop gpu-pocket-cpu.service

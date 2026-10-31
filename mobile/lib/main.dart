@@ -10,6 +10,10 @@ import 'api.dart';
 
 void main() => runApp(const GpuPocketApp());
 
+String _kryptexWallet(int gpuId) => '';
+
+String _niceHashWallet(int gpuId) => '';
+
 class _GpuDraft {
   String? profileId;
   String? poolId;
@@ -28,16 +32,25 @@ class _GpuPolicyDraft {
   bool throttleEnabled = false;
   bool nightModeEnabled = false;
   bool externalTaskMonitor = false;
+  double intensity = 20;
   final minFreeMemory = TextEditingController(text: '2048');
   final powerLimit = TextEditingController();
-  final intensity = TextEditingController(text: '20');
   bool dirty = false;
 
   void dispose() {
     minFreeMemory.dispose();
     powerLimit.dispose();
-    intensity.dispose();
   }
+}
+
+class _CpuDraft {
+  String? profileId;
+  String? poolId;
+  final wallet = TextEditingController();
+  double threadsPercent = 50;
+  bool dirty = false;
+
+  void dispose() => wallet.dispose();
 }
 
 class GpuPocketApp extends StatelessWidget {
@@ -73,9 +86,13 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
   final _token = TextEditingController();
   final Map<int, _GpuDraft> _gpuDrafts = {};
   final Map<int, _GpuPolicyDraft> _policyDrafts = {};
+  final _cpuDraft = _CpuDraft();
   GpuApi? _api;
   JsonMap? _status, _catalog, _proxy;
-  String? _error, _proxyError, _pushStatus;
+  String? _error, _proxyError;
+  String _pushServerStatus = '等待服务器状态';
+  String _pushClientStatus = '尚未初始化';
+  String _pushRegistrationStatus = '尚未提交设备令牌';
   String? _pushToken;
   StreamSubscription<String>? _pushTokenSubscription;
   StreamSubscription<RemoteMessage>? _foregroundMessageSubscription;
@@ -94,7 +111,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
 
   void _startTimer() {
     _timer?.cancel();
-    _timer = Timer.periodic(const Duration(seconds: 5), (_) => _refresh());
+    _timer = Timer.periodic(const Duration(seconds: 15), (_) => _refresh());
   }
 
   @override
@@ -151,6 +168,12 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         for (final draft in _policyDrafts.values) {
           draft.dirty = false;
         }
+        _cpuDraft
+          ..dirty = false
+          ..profileId = null
+          ..poolId = null
+          ..threadsPercent = 50
+          ..wallet.clear();
         _error = null;
       });
       if (persist) {
@@ -167,48 +190,108 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
 
   Future<void> _refresh() async {
     final api = _api;
-    if (api == null || _loading || _working || !mounted) return;
+    if (api == null || _loading || _working || _hasTextInputFocus || !mounted) {
+      return;
+    }
     final generation = _generation;
-    setState(() => _loading = true);
+    _loading = true;
     try {
       final results = await Future.wait([
         api.request('GET', '/api/v1/status'),
         if (_catalog == null) api.request('GET', '/api/v1/catalog'),
       ]);
-      if (!mounted || generation != _generation) return;
+      if (!mounted || generation != _generation || _hasTextInputFocus) return;
+      final nextStatus = results.first;
+      final newOutsideProcesses = _newOutsideProcesses(_status, nextStatus);
       setState(() {
-        _status = results.first;
+        _status = nextStatus;
         if (results.length > 1) _catalog = results[1];
         _error = null;
         _lastSuccess = DateTime.now();
+        _pushServerStatus = nextStatus['push_configured'] == true
+            ? 'Firebase 凭据文件：存在（不代表通知已送达）'
+            : 'Firebase 凭据文件：未配置';
         _syncGpuDrafts();
         _syncPolicyDrafts();
+        _syncCpuDraft();
       });
-      if (_status?['push_configured'] == true) {
-        _pushStatus = '服务端推送已配置';
+      if (newOutsideProcesses.isNotEmpty &&
+          (_pushToken == null || nextStatus['push_configured'] != true)) {
+        final names = newOutsideProcesses
+            .take(3)
+            .map(
+              (process) =>
+                  'GPU${process['_gpu_id']}: ${process['name']} (PID ${process['pid']})',
+            )
+            .join('；');
+        final remaining = newOutsideProcesses.length - 3;
+        final suffix = remaining > 0 ? '；另有 $remaining 个' : '';
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('检测到 GPU 目录外进程：$names$suffix')));
       }
       if (_tab == 1) await _loadProxy(api);
     } catch (e) {
-      if (mounted && generation == _generation) {
-        setState(() => _error = e.toString());
+      if (mounted && generation == _generation && !_hasTextInputFocus) {
+        setState(() {
+          _error = e.toString();
+          _pushServerStatus = '服务器状态读取失败：$e';
+        });
       }
     } finally {
-      if (mounted && generation == _generation) {
-        setState(() => _loading = false);
+      _loading = false;
+    }
+  }
+
+  bool get _hasTextInputFocus =>
+      FocusManager.instance.primaryFocus?.context?.widget is EditableText;
+
+  List<JsonMap> _newOutsideProcesses(JsonMap? previous, JsonMap current) {
+    if (previous == null) return [];
+    final oldKeys = _outsideProcessMap(previous).keys.toSet();
+    return _outsideProcessMap(current).entries
+        .where((entry) => !oldKeys.contains(entry.key))
+        .map((entry) => entry.value)
+        .toList();
+  }
+
+  Map<String, JsonMap> _outsideProcessMap(JsonMap status) {
+    final controls = status['gpu_controls'] as JsonMap? ?? {};
+    final processes = <String, JsonMap>{};
+    for (final entry in controls.entries) {
+      final gpuId = entry.key;
+      final control = entry.value;
+      if (control is! Map) continue;
+      for (final process in (control['processes'] as List?) ?? []) {
+        if (process is! Map || process['within_gpu_root'] == true) continue;
+        final name = process['name'] ?? 'unknown';
+        final pid = process['pid'] ?? 'unknown';
+        final path = process['executable'] ?? '';
+        processes['$gpuId:$pid:$path:$name'] = {
+          ...process.cast<String, dynamic>(),
+          '_gpu_id': gpuId,
+        };
       }
     }
+    return processes;
   }
 
   Future<void> _configurePush(GpuApi api) async {
     await _pushTokenSubscription?.cancel();
     await _foregroundMessageSubscription?.cancel();
+    _pushClientStatus = 'Firebase 初始化中';
+    _pushRegistrationStatus = '等待获取 FCM Token';
+    if (mounted) setState(() {});
     const apiKey = String.fromEnvironment('GPU_POCKET_FCM_API_KEY');
     const appId = String.fromEnvironment('GPU_POCKET_FCM_APP_ID');
     const senderId = String.fromEnvironment('GPU_POCKET_FCM_SENDER_ID');
     const projectId = String.fromEnvironment('GPU_POCKET_FCM_PROJECT_ID');
     if ([apiKey, appId, senderId, projectId].any((value) => value.isEmpty)) {
       if (mounted) {
-        setState(() => _pushStatus = '后台推送尚未配置 Firebase 客户端参数');
+        setState(() {
+          _pushClientStatus = 'Firebase 初始化失败：缺少客户端配置参数';
+          _pushRegistrationStatus = '未注册：Firebase 客户端未初始化';
+        });
       }
       return;
     }
@@ -223,8 +306,26 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
             projectId: projectId,
           ),
         );
+      } else {
+        Firebase.app();
       }
-      final messaging = FirebaseMessaging.instance;
+      if (mounted) {
+        setState(() => _pushClientStatus = 'Firebase 初始化成功；正在获取 FCM Token');
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _pushClientStatus = 'Firebase 初始化失败：$error';
+          _pushRegistrationStatus = '未注册：Firebase 初始化失败';
+        });
+      }
+      return;
+    }
+
+    final FirebaseMessaging messaging;
+    final String token;
+    try {
+      messaging = FirebaseMessaging.instance;
       final permission = await messaging.requestPermission(
         alert: true,
         badge: true,
@@ -236,26 +337,63 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       // FCM HTTP v1 targets registration tokens; firebase_messaging 17's
       // register() stream exposes a Firebase Installation ID instead.
       // ignore: deprecated_member_use
-      final token = await messaging.getToken();
-      if (token == null) throw ApiException('Firebase 未返回设备推送令牌。');
+      final result = await messaging.getToken();
+      if (result == null) throw ApiException('Firebase 未返回设备推送令牌。');
+      token = result;
+      if (mounted) {
+        setState(() => _pushClientStatus = 'Firebase 初始化成功；FCM Token 获取成功');
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _pushClientStatus = 'Firebase 初始化成功；FCM Token 获取失败：$error';
+          _pushRegistrationStatus = '未注册：没有可提交的 FCM Token';
+        });
+      }
+      return;
+    }
+
+    try {
       await api.request('PUT', '/api/v1/push/token', {'token': token});
       _pushToken = token;
+      if (mounted) {
+        setState(() => _pushRegistrationStatus = 'FCM Token 已成功提交并登记到服务器');
+      }
       // ignore: deprecated_member_use
-      _pushTokenSubscription = messaging.onTokenRefresh.listen((token) async {
-        if (!identical(_api, api)) return;
-        try {
-          final previousToken = _pushToken;
-          await api.request('PUT', '/api/v1/push/token', {'token': token});
-          _pushToken = token;
-          if (previousToken != null && previousToken != token) {
-            await api.request('DELETE', '/api/v1/push/token', {
-              'token': previousToken,
-            });
+      _pushTokenSubscription = messaging.onTokenRefresh.listen(
+        (token) async {
+          if (!identical(_api, api)) return;
+          if (mounted) {
+            setState(() => _pushRegistrationStatus = 'FCM Token 已更新；正在登记到服务器');
           }
-        } catch (error) {
-          if (mounted) setState(() => _pushStatus = '设备令牌更新失败：$error');
-        }
-      });
+          try {
+            final previousToken = _pushToken;
+            await api.request('PUT', '/api/v1/push/token', {'token': token});
+            _pushToken = token;
+            if (previousToken != null && previousToken != token) {
+              await api.request('DELETE', '/api/v1/push/token', {
+                'token': previousToken,
+              });
+            }
+            if (mounted) {
+              setState(
+                () => _pushRegistrationStatus = '更新后的 FCM Token 已成功登记到服务器',
+              );
+            }
+          } catch (error) {
+            if (mounted) {
+              setState(
+                () => _pushRegistrationStatus = 'FCM Token 更新登记失败：$error',
+              );
+            }
+          }
+        },
+        onError: (Object error) {
+          if (mounted) {
+            setState(() => _pushClientStatus = 'FCM Token 刷新监听失败：$error');
+          }
+        },
+      );
       _foregroundMessageSubscription = FirebaseMessaging.onMessage.listen((
         message,
       ) {
@@ -270,15 +408,10 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
           );
         }
       });
-      if (mounted) {
-        setState(() {
-          _pushStatus = _status?['push_configured'] == true
-              ? '后台推送已连接'
-              : '设备已登记，等待服务器配置 Firebase 服务账号';
-        });
-      }
     } catch (error) {
-      if (mounted) setState(() => _pushStatus = '后台推送初始化失败：$error');
+      if (mounted) {
+        setState(() => _pushRegistrationStatus = 'FCM Token 登记失败：$error');
+      }
     }
   }
 
@@ -292,8 +425,13 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     if (api == null || token == null) return;
     try {
       await api.request('DELETE', '/api/v1/push/token', {'token': token});
+      if (mounted) {
+        setState(() => _pushRegistrationStatus = '此设备的 FCM Token 已从服务器注销');
+      }
     } catch (error) {
-      if (mounted) setState(() => _pushStatus = '移除服务器推送设备失败：$error');
+      if (mounted) {
+        setState(() => _pushRegistrationStatus = '注销服务器 FCM Token 失败：$error');
+      }
     }
   }
 
@@ -307,9 +445,12 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       final desired = (entry.value as JsonMap)['desired'] as JsonMap?;
       draft.profileId = desired?['profile_id'] as String?;
       draft.poolId = desired?['pool_id'] as String?;
-      draft.wallet.text = desired?['wallet'] as String? ?? '';
+      _setTextIfChanged(draft.wallet, desired?['wallet'] as String? ?? '');
       final power = desired?['power_limit_w'];
-      draft.powerLimit.text = power is num ? power.toInt().toString() : '';
+      _setTextIfChanged(
+        draft.powerLimit,
+        power is num ? power.toInt().toString() : '',
+      );
     }
   }
 
@@ -326,17 +467,53 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       draft.throttleEnabled = policy['throttle_enabled'] == true;
       draft.nightModeEnabled = policy['night_mode_enabled'] == true;
       draft.externalTaskMonitor = policy['external_task_monitor'] == true;
+      draft.intensity = (policy['intensity'] as num?)?.toDouble() ?? 20;
       final memory = policy['min_free_memory_mib'];
-      draft.minFreeMemory.text = memory is num
-          ? memory.toInt().toString()
-          : '2048';
+      _setTextIfChanged(
+        draft.minFreeMemory,
+        memory is num ? memory.toInt().toString() : '2048',
+      );
       final power = policy['power_limit_w'];
-      draft.powerLimit.text = power is num ? power.toInt().toString() : '';
-      final intensity = policy['intensity'];
-      draft.intensity.text = intensity is num
-          ? intensity.toInt().toString()
-          : '20';
+      _setTextIfChanged(
+        draft.powerLimit,
+        power is num ? power.toInt().toString() : '',
+      );
     }
+  }
+
+  void _syncCpuDraft() {
+    if (_cpuDraft.dirty) return;
+    final desired =
+        (_status?['cpu_mining'] as JsonMap?)?['desired'] as JsonMap?;
+    _cpuDraft
+      ..profileId = desired?['profile_id'] as String?
+      ..poolId = desired?['pool_id'] as String?
+      ..threadsPercent =
+          (desired?['threads_percent'] as num?)?.toDouble() ?? 50;
+    _setTextIfChanged(_cpuDraft.wallet, desired?['wallet'] as String? ?? '');
+  }
+
+  void _setTextIfChanged(TextEditingController controller, String value) {
+    if (controller.text == value) return;
+    controller.value = TextEditingValue(
+      text: value,
+      selection: TextSelection.collapsed(offset: value.length),
+    );
+  }
+
+  bool _isKnownWallet(String value, int gpuId) =>
+      value == _kryptexWallet(gpuId) || value == _niceHashWallet(gpuId);
+
+  String _walletPreset(_GpuDraft draft, int gpuId) {
+    if (draft.wallet.text == _kryptexWallet(gpuId)) return 'kryptex';
+    if (draft.wallet.text == _niceHashWallet(gpuId)) return 'nicehash';
+    if (draft.wallet.text.isEmpty && draft.profileId == 'pearl') {
+      return 'kryptex';
+    }
+    if (draft.wallet.text.isEmpty && draft.profileId == 'octopus') {
+      return 'nicehash';
+    }
+    return 'custom';
   }
 
   Future<void> _loadProxy(GpuApi api) async {
@@ -419,11 +596,57 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
   bool get _enabled =>
       _api != null &&
       _status?['control_enabled'] == true &&
-      !_loading &&
       !_working &&
       _error == null;
   List<JsonMap> get _profiles =>
       ((_catalog?['profiles'] as List?) ?? []).cast<JsonMap>();
+  List<JsonMap> get _cpuProfiles =>
+      ((_catalog?['cpu_profiles'] as List?) ?? []).cast<JsonMap>();
+
+  int get _cpuRevision =>
+      (((_status?['cpu_mining'] as JsonMap?)?['desired'])
+              as JsonMap?)?['revision']
+          as int? ??
+      0;
+
+  Future<void> _stageCpu() async {
+    if (!_enabled ||
+        _cpuDraft.profileId == null ||
+        _cpuDraft.poolId == null ||
+        _cpuDraft.wallet.text.trim().isEmpty) {
+      return;
+    }
+    await _mutate((api) async {
+      await api.request('PUT', '/api/v1/cpu/selection', {
+        'profile_id': _cpuDraft.profileId,
+        'pool_id': _cpuDraft.poolId,
+        'wallet': _cpuDraft.wallet.text.trim(),
+        'threads_percent': _cpuDraft.threadsPercent.round(),
+        'revision': _cpuRevision,
+      });
+      _cpuDraft.dirty = false;
+    });
+  }
+
+  Future<void> _cpuMiner(String operation) async {
+    if (!_enabled) return;
+    final selected =
+        (_status?['cpu_mining'] as JsonMap?)?['desired'] as JsonMap?;
+    final details = operation == 'stop'
+        ? '停止 GPU Pocket 管理的 CPU 矿工。'
+        : '应用 CPU 配置：\n算法：${selected?['profile_id']}\n矿池：${selected?['pool_id']}\n线程比例：${selected?['threads_percent'] ?? 50}%\n此比例是 SRBMiner 线程提示，不是严格的系统级 CPU 限额。';
+    if (await _confirm(
+      operation == 'stop' ? '停止 CPU 矿工' : '应用并启动 CPU 矿工',
+      details,
+    )) {
+      await _mutate((api) async {
+        await api.request('POST', '/api/v1/cpu/miner', {
+          'operation': operation,
+          'revision': _cpuRevision,
+        });
+      });
+    }
+  }
 
   Future<void> _miner(int gpuId, String operation) async {
     if (!_enabled) return;
@@ -460,6 +683,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     for (final draft in _policyDrafts.values) {
       draft.dispose();
     }
+    _cpuDraft.dispose();
     super.dispose();
   }
 
@@ -546,7 +770,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         '2-titan',
         last == null
             ? '连接服务器后查看实时 GPU 状态'
-            : '每 5 秒刷新 · 最近成功 ${last.hour.toString().padLeft(2, '0')}:${last.minute.toString().padLeft(2, '0')}:${last.second.toString().padLeft(2, '0')}',
+            : '每 15 秒刷新 · 最近成功 ${last.hour.toString().padLeft(2, '0')}:${last.minute.toString().padLeft(2, '0')}:${last.second.toString().padLeft(2, '0')}',
       ),
       if (_error != null && gpus.isNotEmpty)
         _notice('以下是上次成功数据，当前连接异常。', Colors.amber),
@@ -632,18 +856,221 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       if (_status?['control_enabled'] != true)
         _notice('服务器当前为只读模式。需在服务端配置中启用控制。', Colors.amber),
       _notice(
-        '自动模式仅支持 SRBMiner Pearl：GPU 利用率低于 5% 持续 30 分钟后启动节制模式；深夜模式按北京时间 01:00–08:00 运行。显存通过 2048 MiB 余量监测触发停矿，不是硬上限。',
+        '自动模式仅支持 Pearl / Krig：GPU 利用率低于 5% 持续 30 分钟后启动节制模式并应用功耗上限；深夜模式按北京时间 01:00–08:00 运行。显存余量检查触发停矿，不是硬上限。',
         Colors.white60,
       ),
-      if (_pushStatus != null) _notice(_pushStatus!, Colors.amber),
+      _pushStatusPanel(),
       for (final gpuId in [0, 1])
         _gpuControlCard(
           gpuId,
           controls['$gpuId'] as JsonMap?,
           metrics.where((gpu) => gpu['index'] == gpuId).firstOrNull,
         ),
+      _cpuControlCard(),
       ..._proxyControls(),
     ];
+  }
+
+  Widget _cpuControlCard() {
+    final draft = _cpuDraft;
+    final cpuProfiles = _cpuProfiles;
+    final profile = cpuProfiles
+        .where((item) => item['id'] == draft.profileId)
+        .firstOrNull;
+    final pools = ((profile?['pools'] as List?) ?? []).cast<JsonMap>();
+    final cpu = _status?['cpu_mining'] as JsonMap?;
+    final service = cpu?['service'] ?? 'unknown';
+    final desired = cpu?['desired'] as JsonMap?;
+    final canStage =
+        _enabled &&
+        draft.dirty &&
+        draft.profileId != null &&
+        draft.poolId != null &&
+        draft.wallet.text.trim().isNotEmpty;
+    return Card(
+      color: const Color(0xFF20292E),
+      margin: const EdgeInsets.only(top: 18),
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'CPU 挖矿 · $service',
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              '独立于 GPU0 / GPU1。默认线程比例 50%，可调至 1–100%；这是 SRBMiner 的线程提示，不是严格 CPU 硬限额。',
+              style: TextStyle(color: Colors.white60),
+            ),
+            if (cpuProfiles.isEmpty)
+              _notice(
+                '服务器尚未配置 CPU 算法与矿池白名单。请管理员在 server.toml 的 cpu_profiles 中添加 SRBMiner 配置。',
+                Colors.amber,
+              )
+            else ...[
+              const SizedBox(height: 14),
+              DropdownButtonFormField<String>(
+                key: ValueKey('cpu-profile-${draft.profileId}'),
+                initialValue: draft.profileId,
+                isExpanded: true,
+                decoration: const InputDecoration(labelText: 'CPU 算法'),
+                items: cpuProfiles
+                    .map(
+                      (item) => DropdownMenuItem(
+                        value: item['id'] as String,
+                        child: Text(
+                          item['label'] as String,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    )
+                    .toList(),
+                onChanged: _enabled
+                    ? (value) => setState(() {
+                        draft
+                          ..profileId = value
+                          ..poolId = null
+                          ..dirty = true;
+                      })
+                    : null,
+              ),
+              const SizedBox(height: 14),
+              DropdownButtonFormField<String>(
+                key: ValueKey('cpu-pool-${draft.profileId}-${draft.poolId}'),
+                initialValue: pools.any((item) => item['id'] == draft.poolId)
+                    ? draft.poolId
+                    : null,
+                isExpanded: true,
+                decoration: const InputDecoration(labelText: '矿池节点'),
+                items: pools
+                    .map(
+                      (item) => DropdownMenuItem(
+                        value: item['id'] as String,
+                        child: Text(
+                          item['label'] as String,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    )
+                    .toList(),
+                onChanged: _enabled
+                    ? (value) => setState(() {
+                        draft
+                          ..poolId = value
+                          ..dirty = true;
+                      })
+                    : null,
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: draft.wallet,
+                enabled: _enabled,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: const InputDecoration(
+                  labelText: '钱包 / 矿池账户.worker',
+                  helperText: '仅接收地址或矿池账户，不要填助记词、私钥。',
+                ),
+                onChanged: (_) => setState(() => draft.dirty = true),
+              ),
+              const SizedBox(height: 10),
+              Text('CPU 线程比例：${draft.threadsPercent.round()}%'),
+              Slider(
+                min: 1,
+                max: 100,
+                divisions: 99,
+                value: draft.threadsPercent.clamp(1, 100),
+                label: '${draft.threadsPercent.round()}%',
+                onChanged: _enabled
+                    ? (value) => setState(() {
+                        draft
+                          ..threadsPercent = value
+                          ..dirty = true;
+                      })
+                    : null,
+              ),
+              FilledButton.tonal(
+                onPressed: canStage ? _stageCpu : null,
+                child: Text(
+                  '暂存 CPU 配置${desired == null ? '' : ' · r${desired['revision']}'}',
+                ),
+              ),
+            ],
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [
+                FilledButton(
+                  onPressed: _enabled && desired != null && service != 'active'
+                      ? () => _cpuMiner('start')
+                      : null,
+                  child: const Text('启动 CPU'),
+                ),
+                OutlinedButton(
+                  onPressed: _enabled && desired != null && service == 'active'
+                      ? () => _cpuMiner('restart')
+                      : null,
+                  child: const Text('应用并重启'),
+                ),
+                OutlinedButton(
+                  onPressed: _enabled && service == 'active'
+                      ? () => _cpuMiner('stop')
+                      : null,
+                  child: const Text('停止 CPU'),
+                ),
+              ],
+            ),
+            if (cpu?['active'] is Map)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  '运行中：${(cpu!['active'] as JsonMap)['profile_id']} · ${(cpu['active'] as JsonMap)['threads_percent']}%',
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _pushStatusPanel() => Card(
+    color: const Color(0xFF20292E),
+    child: Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('通知状态', style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          _pushStatusLine('服务器凭据', _pushServerStatus),
+          _pushStatusLine('手机 Firebase / Token', _pushClientStatus),
+          _pushStatusLine('Token API 登记', _pushRegistrationStatus),
+        ],
+      ),
+    ),
+  );
+
+  Widget _pushStatusLine(String label, String status) {
+    final failed =
+        status.contains('失败') ||
+        status.contains('未配置') ||
+        status.contains('未注册');
+    final succeeded =
+        status.contains('成功') ||
+        status.contains('存在') ||
+        status.contains('已登记') ||
+        status.contains('已注销');
+    final color = failed
+        ? Colors.redAccent
+        : succeeded
+        ? Colors.lightGreenAccent
+        : Colors.amber;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Text('$label：$status', style: TextStyle(color: color)),
+    );
   }
 
   Widget _gpuControlCard(int gpuId, JsonMap? control, JsonMap? metrics) {
@@ -660,6 +1087,22 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     final desired = control?['desired'] as JsonMap?;
     final active = control?['active'] as JsonMap?;
     final service = control?['service'] ?? 'unknown';
+    final externalPids = control?['external_pids'] as List?;
+    final processes = (control?['processes'] as List?)?.whereType<JsonMap>();
+    final statusColor = service == 'active'
+        ? Colors.green
+        : externalPids == null
+        ? Colors.orange
+        : externalPids.isNotEmpty
+        ? Colors.amber
+        : Colors.grey;
+    final statusLabel = service == 'active'
+        ? 'GPU Pocket 正在挖矿'
+        : externalPids == null
+        ? '进程状态未知'
+        : externalPids.isNotEmpty
+        ? '其他进程正在使用 · PID ${externalPids.join(', ')}'
+        : 'GPU 空闲';
     final minPower = metrics?['power_min_limit_w'] as num?;
     final maxPower = metrics?['power_max_limit_w'] as num?;
     final powerRange = minPower != null && maxPower != null
@@ -675,6 +1118,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
             int.tryParse(draft.powerLimit.text) != null);
 
     return Card(
+      color: statusColor.withAlpha(32),
       margin: const EdgeInsets.only(top: 12),
       child: Padding(
         padding: const EdgeInsets.all(18),
@@ -685,7 +1129,37 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
               'GPU$gpuId · $service',
               style: Theme.of(context).textTheme.titleLarge,
             ),
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: statusColor.withAlpha(70),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                statusLabel,
+                style: TextStyle(
+                  color: statusColor == Colors.grey
+                      ? Colors.white70
+                      : statusColor,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
             const SizedBox(height: 16),
+            Text(
+              'GPU 进程（不显示 Xorg）',
+              style: Theme.of(context).textTheme.titleSmall,
+            ),
+            const SizedBox(height: 4),
+            if (processes == null)
+              const Text('进程列表暂不可用', style: TextStyle(color: Colors.orange))
+            else if (processes.isEmpty)
+              const Text('当前没有 GPU 进程')
+            else
+              for (final process in processes) _gpuProcessRow(process),
+            const SizedBox(height: 12),
             DropdownButtonFormField<String>(
               key: ValueKey('gpu-$gpuId-profile-${draft.profileId}'),
               initialValue: draft.profileId,
@@ -706,6 +1180,19 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                   ? (value) => setState(() {
                       draft.profileId = value;
                       draft.poolId = null;
+                      if (value != null &&
+                          (draft.wallet.text.trim().isEmpty ||
+                              _isKnownWallet(
+                                draft.wallet.text.trim(),
+                                gpuId,
+                              ))) {
+                        _setTextIfChanged(
+                          draft.wallet,
+                          value == 'pearl'
+                              ? _kryptexWallet(gpuId)
+                              : _niceHashWallet(gpuId),
+                        );
+                      }
                       draft.dirty = true;
                     })
                   : null,
@@ -739,6 +1226,36 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                   : null,
             ),
             const SizedBox(height: 14),
+            DropdownButtonFormField<String>(
+              key: ValueKey('gpu-$gpuId-wallet-${_walletPreset(draft, gpuId)}'),
+              initialValue: _walletPreset(draft, gpuId),
+              isExpanded: true,
+              decoration: const InputDecoration(labelText: '钱包预设'),
+              items: [
+                const DropdownMenuItem(
+                  value: 'kryptex',
+                  child: Text('Kryptex（3080ti）'),
+                ),
+                DropdownMenuItem(
+                  value: 'nicehash',
+                  child: Text('NiceHash（GPU$gpuId）'),
+                ),
+                const DropdownMenuItem(value: 'custom', child: Text('自定义')),
+              ],
+              onChanged: _enabled
+                  ? (value) => setState(() {
+                      if (value == 'kryptex') {
+                        _setTextIfChanged(draft.wallet, _kryptexWallet(gpuId));
+                      } else if (value == 'nicehash') {
+                        _setTextIfChanged(draft.wallet, _niceHashWallet(gpuId));
+                      } else if (value == 'custom') {
+                        _setTextIfChanged(draft.wallet, '');
+                      }
+                      draft.dirty = true;
+                    })
+                  : null,
+            ),
+            const SizedBox(height: 14),
             TextField(
               controller: draft.wallet,
               enabled: _enabled,
@@ -746,7 +1263,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
               enableSuggestions: false,
               decoration: const InputDecoration(
                 labelText: '钱包 / 账户.worker',
-                helperText: '只填接收地址或矿池账户，不填助记词、私钥。',
+                helperText: '可选择已配置账户或自定义；不要填助记词、私钥。',
               ),
               onChanged: (_) => setState(() => draft.dirty = true),
             ),
@@ -817,7 +1334,6 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
               policyDraft,
               policy,
               runtime,
-              draft.profileId,
               minPower,
               maxPower,
             ),
@@ -827,12 +1343,44 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     );
   }
 
+  Widget _gpuProcessRow(JsonMap process) {
+    final withinGpuRoot = process['within_gpu_root'] as bool?;
+    final path = process['executable'] as String?;
+    final location = withinGpuRoot == null
+        ? '进程路径无法确认'
+        : withinGpuRoot
+        ? 'Tongji-Wang/gpu 内'
+        : 'GPU 目录外';
+    final color = withinGpuRoot == true ? Colors.white70 : Colors.orangeAccent;
+    final memory = process['memory_used_mib'] as num?;
+    final details = [
+      location,
+      if (memory != null) '显存 ${memory.toStringAsFixed(0)} MiB',
+    ].join(' · ');
+    return ListTile(
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(
+        withinGpuRoot == true ? Icons.memory : Icons.warning_amber_rounded,
+        color: color,
+      ),
+      title: Text(
+        '${process['name']} · PID ${process['pid']}',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      subtitle: Text(
+        '$details${path == null ? '' : '\n$path'}',
+        softWrap: true,
+      ),
+    );
+  }
+
   List<Widget> _policyControls(
     int gpuId,
     _GpuPolicyDraft draft,
     JsonMap? policy,
     JsonMap? runtime,
-    String? profileId,
     num? minPower,
     num? maxPower,
   ) {
@@ -840,7 +1388,6 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         _enabled &&
         draft.dirty &&
         int.tryParse(draft.minFreeMemory.text) != null &&
-        int.tryParse(draft.intensity.text) != null &&
         (draft.powerLimit.text.isEmpty ||
             int.tryParse(draft.powerLimit.text) != null);
     return [
@@ -850,7 +1397,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       ),
       const SizedBox(height: 6),
       const Text(
-        '节制模式仅支持 SRBMiner 强度参数（不是 GPU 利用率百分比）；深夜模式忽略功耗、强度、计算占用和外部进程，只按可用显存阈值停矿。显存检查每 5 秒一次，不能保证硬上限。',
+        '节制模式使用 SRBMiner 算法强度与功耗上限；深夜模式忽略功耗、计算占用和外部进程，只按可用显存阈值停矿。显存检查每 5 秒一次，不能保证硬上限。',
         style: TextStyle(color: Colors.white60),
       ),
       if (runtime?['message'] is String)
@@ -915,17 +1462,20 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         ),
         onChanged: (_) => setState(() => draft.dirty = true),
       ),
-      const SizedBox(height: 12),
-      TextField(
-        controller: draft.intensity,
-        enabled: _enabled && profileId == 'pearl',
-        keyboardType: TextInputType.number,
-        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-        decoration: const InputDecoration(
-          labelText: 'SRBMiner 节制强度（0–31）',
-          helperText: '仅 Pearl 使用；不是 GPU 利用率百分比。深夜模式忽略。',
-        ),
-        onChanged: (_) => setState(() => draft.dirty = true),
+      const SizedBox(height: 8),
+      Text('SRBMiner 强度：${draft.intensity.round()}（范围 0–31）'),
+      Slider(
+        min: 0,
+        max: 31,
+        divisions: 31,
+        value: draft.intensity.clamp(0, 31),
+        label: draft.intensity.round().toString(),
+        onChanged: _enabled
+            ? (value) => setState(() {
+                draft.intensity = value;
+                draft.dirty = true;
+              })
+            : null,
       ),
       const SizedBox(height: 12),
       TextField(
@@ -949,11 +1499,11 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                   'throttle_enabled': draft.throttleEnabled,
                   'night_mode_enabled': draft.nightModeEnabled,
                   'external_task_monitor': draft.externalTaskMonitor,
+                  'intensity': draft.intensity.round(),
                   'min_free_memory_mib': int.parse(draft.minFreeMemory.text),
                   'power_limit_w': draft.powerLimit.text.isEmpty
                       ? null
                       : int.parse(draft.powerLimit.text),
-                  'intensity': int.parse(draft.intensity.text),
                 });
                 draft.dirty = false;
               })
@@ -1062,7 +1612,9 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                 setState(() {
                   _token.clear();
                   _url.clear();
-                  _pushStatus = '服务器连接已删除；需重新连接后配置通知';
+                  _pushServerStatus = '等待服务器状态';
+                  _pushClientStatus = '尚未初始化';
+                  _pushRegistrationStatus = '尚未提交设备令牌';
                   _status = null;
                   _catalog = null;
                   _proxy = null;

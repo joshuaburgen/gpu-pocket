@@ -196,12 +196,22 @@ impl PushService {
             current.retain(|token| !invalid_tokens.contains(token));
             self.write_tokens(&current)?;
         }
-        if !failures.is_empty() {
-            bail!(
-                "Firebase Cloud Messaging failed for {} device(s): {}",
-                failures.len(),
-                failures.join("; ")
-            );
+        if !invalid_tokens.is_empty() || !failures.is_empty() {
+            let mut reasons = Vec::new();
+            if !invalid_tokens.is_empty() {
+                reasons.push(format!(
+                    "{} device token(s) are no longer registered",
+                    invalid_tokens.len()
+                ));
+            }
+            if !failures.is_empty() {
+                reasons.push(format!(
+                    "{} device(s): {}",
+                    failures.len(),
+                    failures.join("; ")
+                ));
+            }
+            bail!("Firebase Cloud Messaging failed: {}", reasons.join("; "));
         }
         Ok(())
     }

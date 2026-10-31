@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use config::{Config, GpuMode, GpuPolicy, Selection};
+use config::{Config, CpuSelection, GpuMode, GpuPolicy, Selection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -31,10 +31,18 @@ struct App {
     demo: bool,
     mutation: Arc<Mutex<()>>,
     demo_active: Arc<Mutex<BTreeMap<u32, Selection>>>,
+    demo_cpu_active: Arc<Mutex<Option<CpuSelection>>>,
     demo_node: Arc<Mutex<String>>,
     runtime: Arc<Mutex<BTreeMap<u32, RuntimeState>>>,
+    process_watch: Arc<Mutex<ProcessWatchState>>,
     push: Arc<push::PushService>,
     client: reqwest::Client,
+}
+
+#[derive(Default)]
+struct ProcessWatchState {
+    initialized: bool,
+    external: BTreeMap<(u32, u32, String), gpu::GpuProcess>,
 }
 
 #[derive(Default)]
@@ -81,6 +89,8 @@ fn router(app: App) -> Router {
         .route("/api/v1/catalog", get(catalog))
         .route("/api/v1/selection", put(save))
         .route("/api/v1/miner", post(action))
+        .route("/api/v1/cpu/selection", put(save_cpu_selection))
+        .route("/api/v1/cpu/miner", post(action_cpu))
         .route("/api/v1/gpus/{gpu_id}/selection", put(save_gpu))
         .route("/api/v1/gpus/{gpu_id}/miner", post(action_gpu))
         .route(
@@ -102,6 +112,26 @@ fn unit_name(gpu_id: u32) -> Result<String> {
         bail!("gpu_id must be 0 or 1");
     }
     Ok(format!("gpu-pocket-miner@{gpu_id}.service"))
+}
+
+const CPU_UNIT: &str = "gpu-pocket-cpu.service";
+
+async fn cpu_service_state(app: &App) -> Result<String> {
+    if app.demo {
+        return Ok(if app.demo_cpu_active.lock().await.is_some() {
+            "active"
+        } else {
+            "inactive"
+        }
+        .into());
+    }
+    Ok(gpu::output(
+        "/usr/bin/systemctl",
+        &["show", CPU_UNIT, "--property=ActiveState", "--value"],
+    )
+    .await?
+    .trim()
+    .into())
 }
 
 async fn service_state(app: &App, gpu_id: u32) -> Result<String> {
@@ -137,6 +167,17 @@ async fn status(State(app): State<App>) -> ApiResult {
             vec![]
         }
     };
+    let process_snapshot = if app.demo {
+        Some(Vec::new())
+    } else {
+        match gpu::processes(&app.config.gpu_root).await {
+            Ok(processes) => Some(processes),
+            Err(error) => {
+                errors.push(format!("GPU process list: {error}"));
+                None
+            }
+        }
+    };
     let mut gpu_controls = BTreeMap::new();
     let mut policies = BTreeMap::new();
     for gpu_id in GPU_IDS {
@@ -167,9 +208,32 @@ async fn status(State(app): State<App>) -> ApiResult {
         } else {
             None
         };
+        let external_pids = if app.demo {
+            Some(Vec::new())
+        } else {
+            match gpu::unmanaged_compute_pids(gpu_id).await {
+                Ok(pids) => Some(pids),
+                Err(error) => {
+                    errors.push(format!("GPU{gpu_id} process status: {error}"));
+                    None
+                }
+            }
+        };
+        let processes = process_snapshot.as_ref().map(|processes| {
+            processes
+                .iter()
+                .filter(|process| process.gpu_id == gpu_id)
+                .collect::<Vec<_>>()
+        });
         gpu_controls.insert(
             gpu_id.to_string(),
-            json!({"service":service,"desired":desired,"active":active}),
+            json!({
+                "service":service,
+                "desired":desired,
+                "active":active,
+                "external_pids":external_pids,
+                "processes":processes
+            }),
         );
         let policy = match app.config.read_gpu_policy(gpu_id) {
             Ok(policy) => Some(policy),
@@ -204,10 +268,38 @@ async fn status(State(app): State<App>) -> ApiResult {
     let service = gpu_controls["0"]["service"].clone();
     let desired = gpu_controls["0"]["desired"].clone();
     let active = gpu_controls["0"]["active"].clone();
+    let cpu_service = match cpu_service_state(&app).await {
+        Ok(value) => value,
+        Err(error) => {
+            errors.push(format!("CPU miner service: {error}"));
+            "unknown".into()
+        }
+    };
+    let cpu_desired = match read_cpu_desired(&app) {
+        Ok(selection) => selection,
+        Err(error) => {
+            errors.push(format!("CPU desired selection: {error}"));
+            None
+        }
+    };
+    let cpu_active = if app.demo {
+        app.demo_cpu_active.lock().await.clone()
+    } else if cpu_service == "active" {
+        match app.config.read_cpu_selection("active") {
+            Ok(selection) => Some(selection),
+            Err(error) => {
+                errors.push(format!("CPU active selection: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     Ok(Json(
         json!({"host": "2-titan", "demo": app.demo, "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         "gpus": gpus, "service": service, "desired": desired, "active": active,
         "gpu_controls":gpu_controls,"policies":policies,
+        "cpu_mining":{"service":cpu_service,"desired":cpu_desired,"active":cpu_active},
         "push_configured":app.push.configured(),
         "control_enabled": app.config.control_enabled, "errors": errors}),
     ))
@@ -235,7 +327,112 @@ async fn catalog(State(app): State<App>) -> ApiResult {
         .iter()
         .map(|p| json!({"id":p.id,"label":p.label,"pools":p.pools}))
         .collect();
-    Ok(Json(json!({"profiles": profiles})))
+    let cpu_profiles: Vec<_> = app
+        .config
+        .cpu_profiles
+        .iter()
+        .map(|p| json!({"id":p.id,"label":p.label,"algorithm":p.algorithm,"pools":p.pools}))
+        .collect();
+    Ok(Json(
+        json!({"profiles": profiles,"cpu_profiles":cpu_profiles}),
+    ))
+}
+
+fn read_cpu_desired(app: &App) -> Result<Option<CpuSelection>> {
+    let path = app.config.state_dir.join("cpu-desired.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let desired = app.config.read_cpu_selection("desired")?;
+    app.config.resolve_cpu(&desired)?;
+    Ok(Some(desired))
+}
+
+async fn save_cpu_selection(
+    State(app): State<App>,
+    Json(mut selected): Json<CpuSelection>,
+) -> ApiResult {
+    writable(&app)?;
+    let _guard = app.mutation.lock().await;
+    app.config.resolve_cpu(&selected).map_err(bad)?;
+    let revision = read_cpu_desired(&app)?.map_or(0, |s| s.revision);
+    if selected.revision != revision {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "selection changed; refresh before saving".into(),
+        ));
+    }
+    selected.revision = revision
+        .checked_add(1)
+        .ok_or_else(|| bad("revision overflow"))?;
+    app.config.save_cpu_selection("desired", &selected)?;
+    tracing::info!(
+        revision = selected.revision,
+        threads_percent = selected.threads_percent,
+        "CPU selection staged"
+    );
+    Ok(Json(json!({"selection":selected,"applied":false})))
+}
+
+async fn action_cpu(State(app): State<App>, Json(action): Json<Action>) -> ApiResult {
+    writable(&app)?;
+    let _guard = app.mutation.lock().await;
+    let selection = read_cpu_desired(&app)?;
+    if selection.as_ref().map_or(0, |s| s.revision) != action.revision {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "selection changed; refresh before applying".into(),
+        ));
+    }
+    let operation = match action.operation {
+        Operation::Start => "start",
+        Operation::Restart => "restart",
+        Operation::Stop => "stop",
+    };
+    if operation != "stop" {
+        let selected = selection
+            .as_ref()
+            .ok_or_else(|| bad("save a CPU selection first"))?;
+        let (profile, _) = app.config.resolve_cpu(selected).map_err(bad)?;
+        if !app.demo {
+            ensure_miner_binary(&app.config, &profile.binary)?;
+        }
+    }
+    if app.demo {
+        let mut active = app.demo_cpu_active.lock().await;
+        if operation == "stop" {
+            *active = None;
+        } else if operation == "restart" || active.is_none() {
+            app.config
+                .save_cpu_selection("applied", selection.as_ref().unwrap())?;
+            *active = selection;
+        }
+    } else {
+        if operation != "stop"
+            && (operation == "restart" || cpu_service_state(&app).await? != "active")
+        {
+            app.config
+                .save_cpu_selection("applied", selection.as_ref().unwrap())?;
+        }
+        gpu::output(
+            "/usr/bin/sudo",
+            &["-n", "/usr/bin/systemctl", operation, CPU_UNIT],
+        )
+        .await?;
+        let actual = cpu_service_state(&app).await?;
+        if (operation == "stop" && actual != "inactive")
+            || (operation != "stop" && actual != "active")
+        {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("CPU miner service is {actual}; inspect journal before retrying"),
+            ));
+        }
+    }
+    tracing::info!(operation, "CPU miner control completed");
+    Ok(Json(
+        json!({"ok":true,"operation":operation,"demo":app.demo}),
+    ))
 }
 
 fn writable(app: &App) -> std::result::Result<(), ApiError> {
@@ -342,11 +539,11 @@ async fn save_policy(
     if policy.gpu_id != gpu_id {
         return Err(bad("gpu_id does not match the request path"));
     }
-    if !(512..=16_384).contains(&policy.min_free_memory_mib) {
-        return Err(bad("min_free_memory_mib must be between 512 and 16384"));
-    }
     if policy.intensity > 31 {
         return Err(bad("SRBMiner intensity must be between 0 and 31"));
+    }
+    if !(512..=16_384).contains(&policy.min_free_memory_mib) {
+        return Err(bad("min_free_memory_mib must be between 512 and 16384"));
     }
     if policy.throttle_enabled || policy.night_mode_enabled {
         let selection = read_desired(&app, gpu_id)?
@@ -424,6 +621,86 @@ async fn policy_loop(app: App) {
             tracing::error!(%error, "GPU automation tick failed");
         }
     }
+}
+
+async fn process_monitor_loop(app: App) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if let Err(error) = process_monitor_tick(&app).await {
+            tracing::error!(%error, "GPU process monitor tick failed");
+        }
+    }
+}
+
+async fn process_monitor_tick(app: &App) -> Result<()> {
+    if app.demo {
+        return Ok(());
+    }
+    let processes = gpu::processes(&app.config.gpu_root).await?;
+    let mut current = BTreeMap::new();
+    for process in processes
+        .into_iter()
+        .filter(|process| process.within_gpu_root != Some(true))
+    {
+        let location = process
+            .executable
+            .clone()
+            .unwrap_or_else(|| format!("unknown:{}", process.name));
+        current.insert((process.gpu_id, process.pid, location), process);
+    }
+    let newly_detected = {
+        let mut watch = app.process_watch.lock().await;
+        update_process_snapshot(&mut watch, current)
+    };
+    for gpu_id in GPU_IDS {
+        let new_for_gpu: Vec<_> = newly_detected
+            .iter()
+            .filter(|process| process.gpu_id == gpu_id)
+            .collect();
+        if new_for_gpu.is_empty() {
+            continue;
+        }
+        let listed = new_for_gpu
+            .iter()
+            .take(4)
+            .map(|process| format!("{} (PID {})", process.name, process.pid))
+            .collect::<Vec<_>>()
+            .join("，");
+        let remainder = new_for_gpu.len().saturating_sub(4);
+        let suffix = if remainder > 0 {
+            format!("，另有 {remainder} 个进程")
+        } else {
+            String::new()
+        };
+        notify_policy(
+            app,
+            gpu_id,
+            "检测到 GPU 目录外进程",
+            &format!("GPU{gpu_id} 新进程：{listed}{suffix}。请在 GPU Pocket 中查看进程路径。"),
+        )
+        .await;
+    }
+    Ok(())
+}
+
+fn update_process_snapshot(
+    watch: &mut ProcessWatchState,
+    current: BTreeMap<(u32, u32, String), gpu::GpuProcess>,
+) -> Vec<gpu::GpuProcess> {
+    let newly_detected = if watch.initialized {
+        current
+            .iter()
+            .filter(|(key, _)| !watch.external.contains_key(*key))
+            .map(|(_, process)| process.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    watch.external = current;
+    watch.initialized = true;
+    newly_detected
 }
 
 fn is_china_night(now: SystemTime) -> Result<bool> {
@@ -853,6 +1130,52 @@ async fn proxy_select(State(app): State<App>, Json(node): Json<Node>) -> ApiResu
     Ok(Json(json!({"ok":true,"demo":app.demo})))
 }
 
+fn ensure_miner_binary(config: &Config, relative: &std::path::Path) -> Result<std::path::PathBuf> {
+    let root = config.gpu_root.canonicalize()?;
+    let binary = config.gpu_root.join(relative).canonicalize()?;
+    if !binary.starts_with(root) {
+        bail!("binary escaped gpu_root");
+    }
+    Ok(binary)
+}
+
+fn launch_cpu(config: &Config) -> Result<()> {
+    let selection = config.read_cpu_selection("applied")?;
+    let (profile, pool) = config.resolve_cpu(&selection)?;
+    let binary = ensure_miner_binary(config, &profile.binary)?;
+    let mut command = std::process::Command::new(&binary);
+    command.current_dir(binary.parent().context("binary has no parent")?);
+    command.args([
+        "--algorithm-cpu",
+        &profile.algorithm,
+        "--disable-gpu",
+        "--pool",
+        &pool.address,
+        "--wallet",
+        &selection.wallet,
+        "--pass",
+        "x",
+        "--tls",
+        if pool.tls { "true" } else { "false" },
+        "--cpu-threads-percent",
+        &selection.threads_percent.to_string(),
+        "--retry-time",
+        "5",
+        "--give-up-limit",
+        "3",
+    ]);
+    config.save_cpu_selection("active", &selection)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec().into())
+    }
+    #[cfg(not(unix))]
+    {
+        bail!("miner execution requires Linux");
+    }
+}
+
 fn launch(config: &Config, gpu_id: u32) -> Result<()> {
     unit_name(gpu_id)?;
     let selection = config.read_gpu_selection("applied", gpu_id)?;
@@ -862,13 +1185,10 @@ fn launch(config: &Config, gpu_id: u32) -> Result<()> {
     let (profile, pool) = config.resolve(&selection)?;
     let mode = config.read_gpu_mode(gpu_id)?;
     let policy = config.read_gpu_policy(gpu_id)?;
-    let binary = config.gpu_root.join(&profile.binary).canonicalize()?;
-    if !binary.starts_with(config.gpu_root.canonicalize()?) {
-        bail!("binary escaped gpu_root");
-    }
-    let tls = if pool.tls { "true" } else { "false" };
+    let binary = ensure_miner_binary(config, &profile.binary)?;
     let mut command = std::process::Command::new(&binary);
     command.current_dir(binary.parent().context("binary has no parent")?);
+    let tls = if pool.tls { "true" } else { "false" };
     if profile.miner == "srb-pearl" {
         let api_port = (21550 + gpu_id).to_string();
         command.args([
@@ -953,13 +1273,17 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let args: Vec<_> = std::env::args().collect();
-    let miner = args.get(1).is_some_and(|s| s == "miner");
+    let cpu_miner = args.get(1).is_some_and(|s| s == "cpu-miner");
+    let miner = cpu_miner || args.get(1).is_some_and(|s| s == "miner");
     let path = args
         .get(if miner { 2 } else { 1 })
         .map(String::as_str)
         .unwrap_or("server.toml");
     let config = Config::load(path)?;
     if miner {
+        if cpu_miner {
+            return launch_cpu(&config);
+        }
         let gpu_id = args.get(3).map_or(Ok(0), |value| value.parse::<u32>())?;
         return launch(&config, gpu_id);
     }
@@ -975,9 +1299,18 @@ async fn main() -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .build()?;
+    let mut push_client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15));
+    if let Ok(proxy) = std::env::var("GPU_POCKET_FCM_PROXY") {
+        if !proxy.trim().is_empty() {
+            push_client = push_client.proxy(reqwest::Proxy::all(proxy.trim())?);
+        }
+    }
     let push = Arc::new(push::PushService::new(
         config.state_dir.clone(),
-        client.clone(),
+        push_client.build()?,
     ));
     let app = App {
         config: Arc::new(config),
@@ -985,13 +1318,16 @@ async fn main() -> Result<()> {
         demo,
         mutation: Arc::new(Mutex::new(())),
         demo_active: Arc::new(Mutex::new(BTreeMap::new())),
+        demo_cpu_active: Arc::new(Mutex::new(None)),
         demo_node: Arc::new(Mutex::new("DEMO-HK".into())),
         runtime: Arc::new(Mutex::new(BTreeMap::new())),
+        process_watch: Arc::new(Mutex::new(ProcessWatchState::default())),
         push,
         client,
     };
     if !demo {
         tokio::spawn(policy_loop(app.clone()));
+        tokio::spawn(process_monitor_loop(app.clone()));
     }
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address, demo, "GPU Pocket API listening");

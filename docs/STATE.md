@@ -34,7 +34,7 @@ Flutter 端包含监控、控制和连接三个页面，提供自动刷新、后
 
 部署目录提供只读 API unit、GPU0/GPU1 共用的 miner systemd 模板、限定到两张卡实例的 sudoers、Cloudflare Tunnel 和 IPv6 Caddy 示例。当前实际运行的是 tools/install_quick.py 安装的用户级只读服务，尚未安装矿工 unit 或 sudoers。GitHub Actions 检查工作流已写入，尚未在 GitHub 运行。
 
-逐卡自动策略需全局 `control_enabled = true` 并在 App 中逐卡启用；所有策略默认关闭。节制和深夜模式目前只支持 Pearl/SRBMiner。深夜模式忽略功耗／强度、计算占用和外部进程；显存通过 5 秒轮询阈值触发停矿，不是硬上限。节制／日间提醒检测外部任务时不会停止外部进程，只暂停 GPU Pocket 管理的矿工。推送依赖 Firebase 项目及服务账号配置。
+逐卡自动策略需全局 `control_enabled = true` 并在 App 中逐卡启用；所有策略默认关闭。节制和深夜模式目前只支持 Pearl/Krig。深夜模式忽略功耗、计算占用和外部进程；显存通过 5 秒轮询阈值触发停矿，不是硬上限。节制／日间提醒检测外部任务时不会停止外部进程，只暂停 GPU Pocket 管理的矿工。推送依赖 Firebase 项目及服务账号配置。
 
 ## 验证证据
 

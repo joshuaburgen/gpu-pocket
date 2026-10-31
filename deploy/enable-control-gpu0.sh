@@ -18,12 +18,15 @@ api_env="$config_dir/api.env"
 api_binary="$api_dir/gpu-pocket-server"
 unit_source="$staging_dir/gpu-pocket-miner@.service"
 sudoers_source="$staging_dir/gpu-pocket-gpu0.sudoers"
+api_control_source="$staging_dir/gpu-pocket-api-control.conf"
 binary_source="$staging_dir/gpu-pocket-server"
 unit_target=/etc/systemd/system/gpu-pocket-miner@.service
 sudoers_target=/etc/sudoers.d/gpu-pocket-gpu0
+api_unit_dir="$api_home/.config/systemd/user/gpu-pocket-api.service.d"
+api_unit_override="$api_unit_dir/50-gpu-control.conf"
 backup_dir="/var/backups/gpu-pocket-control/$(date -u +%Y%m%dT%H%M%SZ)"
 
-for file in "$unit_source" "$sudoers_source" "$binary_source" "$api_config" "$api_env" "$api_binary"; do
+for file in "$unit_source" "$sudoers_source" "$api_control_source" "$binary_source" "$api_config" "$api_env" "$api_binary"; do
     if [[ ! -f $file ]]; then
         echo "Required file not found: $file" >&2
         exit 1
@@ -54,6 +57,9 @@ visudo -cf "$sudoers_source"
 install -d -m 0700 "$backup_dir"
 cp -a "$api_config" "$backup_dir/server.toml"
 cp -a "$api_binary" "$backup_dir/gpu-pocket-server"
+if [[ -f $api_unit_dir/../gpu-pocket-api.service ]]; then
+    cp -a "$api_unit_dir/../gpu-pocket-api.service" "$backup_dir/gpu-pocket-api.service"
+fi
 
 sed 's/^control_enabled = false$/control_enabled = true/' "$api_config" > "$backup_dir/server.toml.enabled"
 if ! grep -Fxq 'control_enabled = true' "$backup_dir/server.toml.enabled"; then
@@ -69,12 +75,19 @@ install -o root -g root -m 0644 "$unit_source" "$unit_target"
 install -o root -g root -m 0440 "$sudoers_source" "$sudoers_target"
 visudo -c
 
+install -d -o "$api_user" -g "$api_group" -m 0755 "$api_unit_dir"
+install -o "$api_user" -g "$api_group" -m 0644 "$api_control_source" "$api_unit_override"
+
 install -o "$api_user" -g "$api_group" -m 0755 "$binary_source" "$api_binary.next"
 mv -f "$api_binary.next" "$api_binary"
 install -o "$api_user" -g "$api_group" -m 0600 "$backup_dir/server.toml.enabled" "$api_config"
 systemctl daemon-reload
 
 api_uid=$(id -u "$api_user")
+runuser -u "$api_user" -- env \
+    XDG_RUNTIME_DIR="/run/user/$api_uid" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$api_uid/bus" \
+    systemctl --user daemon-reload
 runuser -u "$api_user" -- env \
     XDG_RUNTIME_DIR="/run/user/$api_uid" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$api_uid/bus" \

@@ -19,8 +19,10 @@ fn fixture() -> (App, tempfile::TempDir) {
         demo: true,
         mutation: Arc::new(Mutex::new(())),
         demo_active: Arc::new(Mutex::new(BTreeMap::new())),
+        demo_cpu_active: Arc::new(Mutex::new(None)),
         demo_node: Arc::new(Mutex::new("DEMO-HK".into())),
         runtime: Arc::new(Mutex::new(BTreeMap::new())),
+        process_watch: Arc::new(Mutex::new(ProcessWatchState::default())),
         push: Arc::new(crate::push::PushService::new(
             dir.path().to_path_buf(),
             reqwest::Client::new(),
@@ -56,6 +58,8 @@ async fn all_routes_require_authentication() {
         ("GET", "/api/v1/catalog"),
         ("PUT", "/api/v1/selection"),
         ("POST", "/api/v1/miner"),
+        ("PUT", "/api/v1/cpu/selection"),
+        ("POST", "/api/v1/cpu/miner"),
         ("PUT", "/api/v1/gpus/0/selection"),
         ("POST", "/api/v1/gpus/1/miner"),
         ("GET", "/api/v1/gpus/1/policy"),
@@ -76,6 +80,50 @@ async fn all_routes_require_authentication() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
     }
+}
+
+#[tokio::test]
+async fn status_reports_external_gpu_processes() {
+    let (app, _dir) = fixture();
+    let (status, body) = call(&app, "GET", "/api/v1/status", Value::Null).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["gpu_controls"]["0"]["external_pids"], json!([]));
+    assert_eq!(body["gpu_controls"]["1"]["external_pids"], json!([]));
+    assert_eq!(body["gpu_controls"]["0"]["processes"], json!([]));
+    assert_eq!(body["gpu_controls"]["1"]["processes"], json!([]));
+}
+
+#[test]
+fn process_alerts_only_fire_for_new_outside_processes() {
+    let mut watch = ProcessWatchState::default();
+    let process = gpu::GpuProcess {
+        gpu_id: 1,
+        pid: 123,
+        process_type: "C".into(),
+        name: "python".into(),
+        memory_used_mib: Some(64.0),
+        executable: Some("/tmp/python".into()),
+        within_gpu_root: Some(false),
+    };
+    let key = (1, 123, "/tmp/python".into());
+
+    assert!(
+        update_process_snapshot(&mut watch, BTreeMap::from([(key.clone(), process.clone())]))
+            .is_empty()
+    );
+    assert!(
+        update_process_snapshot(&mut watch, BTreeMap::from([(key.clone(), process.clone())]))
+            .is_empty()
+    );
+    assert_eq!(
+        update_process_snapshot(&mut watch, BTreeMap::new()).len(),
+        0
+    );
+    assert_eq!(
+        update_process_snapshot(&mut watch, BTreeMap::from([(key, process)])).len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -121,11 +169,13 @@ async fn stage_apply_conflict_and_stop() {
         StatusCode::OK
     );
     selection["revision"] = json!(1);
-    selection["pool_id"] = json!("hk");
+    selection["wallet"] = json!("updatedWallet.worker");
     call(&app, "PUT", "/api/v1/selection", selection).await;
     let (_, status) = call(&app, "GET", "/api/v1/status", Value::Null).await;
     assert_eq!(status["active"]["pool_id"], "sg");
-    assert_eq!(status["desired"]["pool_id"], "hk");
+    assert_eq!(status["desired"]["pool_id"], "sg");
+    assert_eq!(status["active"]["wallet"], "testWallet.worker");
+    assert_eq!(status["desired"]["wallet"], "updatedWallet.worker");
     assert_eq!(
         app.config.read_gpu_selection("applied", 0).unwrap().pool_id,
         "sg"
@@ -138,7 +188,7 @@ async fn stage_apply_conflict_and_stop() {
     )
     .await;
     let (_, status) = call(&app, "GET", "/api/v1/status", Value::Null).await;
-    assert_eq!(status["active"]["pool_id"], "hk");
+    assert_eq!(status["active"]["pool_id"], "sg");
     call(
         &app,
         "POST",
@@ -147,6 +197,73 @@ async fn stage_apply_conflict_and_stop() {
     )
     .await;
     assert!(app.demo_active.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn cpu_mining_is_independent_and_defaults_to_half_threads() {
+    let (app, _dir) = fixture();
+    let (_, catalog) = call(&app, "GET", "/api/v1/catalog", Value::Null).await;
+    assert_eq!(catalog["cpu_profiles"][0]["id"], "xmr-randomx");
+    assert_eq!(catalog["cpu_profiles"][0]["algorithm"], "randomx");
+
+    let selected = json!({
+        "profile_id":"xmr-randomx",
+        "pool_id":"hashvault-ssl",
+        "wallet":"testWallet.worker",
+        "revision":0
+    });
+    let (status, staged) = call(&app, "PUT", "/api/v1/cpu/selection", selected.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(staged["selection"]["threads_percent"], 50);
+    assert_eq!(staged["selection"]["revision"], 1);
+    assert_eq!(
+        call(&app, "PUT", "/api/v1/cpu/selection", selected).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(
+            &app,
+            "PUT",
+            "/api/v1/cpu/selection",
+            json!({
+                "profile_id":"xmr-randomx",
+                "pool_id":"hashvault-ssl",
+                "wallet":"testWallet.worker",
+                "threads_percent":101,
+                "revision":1
+            })
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/api/v1/cpu/miner",
+            json!({"operation":"start","revision":1})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(app.demo_active.lock().await.is_empty());
+    let (_, status) = call(&app, "GET", "/api/v1/status", Value::Null).await;
+    assert_eq!(status["cpu_mining"]["service"], "active");
+    assert_eq!(status["cpu_mining"]["active"]["threads_percent"], 50);
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/api/v1/cpu/miner",
+            json!({"operation":"stop","revision":1})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(cpu_service_state(&app).await.unwrap(), "inactive");
 }
 
 #[tokio::test]
@@ -261,7 +378,6 @@ async fn policies_are_per_gpu_validated_and_disabled_by_default() {
                 "external_task_monitor":true,
                 "min_free_memory_mib":2048,
                 "power_limit_w":250,
-                "intensity":20
             })
         )
         .await
@@ -281,7 +397,6 @@ async fn policies_are_per_gpu_validated_and_disabled_by_default() {
                 "external_task_monitor":false,
                 "min_free_memory_mib":2048,
                 "power_limit_w":250,
-                "intensity":20
             })
         )
         .await
@@ -299,14 +414,41 @@ async fn policies_are_per_gpu_validated_and_disabled_by_default() {
                 "throttle_enabled":true,
                 "night_mode_enabled":false,
                 "external_task_monitor":false,
-                "min_free_memory_mib":2048,
+                "min_free_memory_mib":500,
                 "power_limit_w":250,
-                "intensity":99
             })
         )
         .await
         .0,
         StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn policy_accepts_and_bounds_srb_intensity() {
+    let (app, _dir) = fixture();
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/api/v1/gpus/0/policy",
+        json!({
+            "gpu_id":0,
+            "enabled":true,
+            "throttle_enabled":false,
+            "night_mode_enabled":false,
+            "external_task_monitor":false,
+            "min_free_memory_mib":2048,
+            "power_limit_w":250,
+            "intensity":32
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mut policy = serde_json::to_value(GpuPolicy::new(0)).unwrap();
+    policy["intensity"] = json!(20);
+    assert_eq!(
+        call(&app, "PUT", "/api/v1/gpus/0/policy", policy).await.0,
+        StatusCode::OK
     );
 }
 

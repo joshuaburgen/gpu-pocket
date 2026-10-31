@@ -16,3 +16,7 @@ state/
 __pycache__/
 *.pyc
 *.iml
+google-services.json
+*firebase-adminsdk*.json
+api.env
+credentials.json

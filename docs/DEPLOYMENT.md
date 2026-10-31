@@ -1,6 +1,6 @@
 # 部署与逐 GPU 接管
 
-更新：当前已使用用户级只读 API 与 Quick Tunnel 完成部署，DNS 已恢复。日常使用参见 [当前连接与运维](QUICK_TUNNEL.md)。下文的系统级安装是另一种部署方式，不要在已有用户级 API 占用 8787 时重复启动；真实矿工接管仍未执行。
+更新：生产环境使用用户级 API 与 Quick Tunnel；GPU0/GPU1 已由独立的 `gpu-pocket-miner@<id>.service` 管理。本轮 SRBMiner → Krig 1.5.12 的切换因服务器 glibc 版本不兼容而暂停；生产配置、二进制和运行中矿工未更改。日常使用参见 [当前连接与运维](QUICK_TUNNEL.md)。不要在已有用户级 API 占用 8787 时重复安装或启动系统级 API。
 
 ## 部署前状态
 
@@ -59,7 +59,11 @@ sudo chmod 0600 /etc/gpu-pocket/api.env
 sudo systemctl restart gpu-pocket-api.service
 ```
 
-设备连接 API 后会申请通知权限并注册 FCM 令牌。`/var/lib/gpu-pocket/push-tokens.json` 由服务以权限 `0600` 保存；用户删除 App 连接时，客户端会尝试注销自己的令牌。状态中的 `push_configured` 仅表示服务账号文件存在，不代表 Google 已验证凭据或推送已成功；需查看 API 日志并执行实际手机通知验收。未配置 Firebase 时，矿工策略仍可工作，但推送无法投递。
+设备连接 API 后会申请通知权限并注册 FCM 令牌。`/var/lib/gpu-pocket/push-tokens.json` 由服务以权限 `0600` 保存；用户删除 App 连接时，客户端会尝试注销自己的令牌。状态中的 `push_configured` 仅表示服务账号文件存在，不代表 Google 已验证凭据或推送已成功；需查看 API 日志并执行实际手机通知验收。未配置 Firebase 时，进程列表仍可查看，但推送无法投递。
+
+若服务器直连 Google 不通，可在 API 服务环境中单独设置 `GPU_POCKET_FCM_PROXY`（例如 `http://127.0.0.1:7890`）。此代理只用于 OAuth/FCM 出站请求，不影响手机访问 API 的连接；先验证代理能建立到 `oauth2.googleapis.com` 和 `fcm.googleapis.com` 的 HTTPS 连接，再重启服务并实际验收通知。
+
+服务端进程监视器每 5 秒采样 GPU 进程并排除 Xorg。可执行文件路径不在配置的 `gpu_root` 下或无法确认时，会对新出现的进程发送推送；相同进程持续运行不会重复通知，退出后再出现会再次通知。服务启动后的首次采样作为基线，不会把启动前已有的进程当成新进程告警。
 
 ## 2. HTTPS 入口
 
@@ -71,24 +75,25 @@ sudo systemctl restart gpu-pocket-api.service
 
 若采用 IPv6，使用非临时全局 IPv6 更新域名 AAAA，验证学校上游和主机入站策略，再参考 `deploy/Caddyfile.ipv6.example` 配置有效 TLS 证书。API 继续监听回环。不要关闭手机证书校验。
 
-## 3. 逐卡接管
+## 3. GPU 与 CPU 矿工控制
 
-接管会中断目标 GPU 上的计算。先在机器终端核实旧监督器、矿工 PID、运行参数、钱包及 GPU 分配，保留原有启动方式：
+生产环境 GPU Pearl 使用 SRBMiner，OCTOPUS 使用 lolMiner。Krig 1.5.12 切换因服务器 glibc 不兼容而暂停，服务器端不应按下述旧 Krig 方案更新。替换矿工会中断目标 GPU 上的计算；逐卡切换前保留原矿工目录及启动脚本作为回滚路径：
 
 - Pearl：`~/Tongji-Wang/gpu/research-srb-3-8-0/run-pearl-gpu0-tun.sh [kryptex|prl]`
 - NiceHash：`~/Tongji-Wang/gpu/research-octopus-1.98a/run-nicehash-gpu0-tun.sh`
 
-目录名仍为 `research-srb-3-8-0`，实际二进制已升级至 SRBMiner 3.8.2。不要根据目录名推断版本。
+SRBMiner 目录名为 `research-srb-3-8-0`，此前实际二进制版本为 3.8.2；目录名不代表版本。当前代码 GPU 路径使用 SRBMiner CPU/GPU 分离参数，OCTOPUS 保持 lolMiner。
 
 ```bash
 sudo install -m 0644 deploy/gpu-pocket-miner@.service /etc/systemd/system/
+sudo install -m 0644 deploy/gpu-pocket-cpu.service /etc/systemd/system/
 sudo visudo -cf deploy/gpu-pocket.sudoers
 sudo install -m 0440 -o root -g root deploy/gpu-pocket.sudoers /etc/sudoers.d/gpu-pocket
 sudo visudo -c
 sudo systemctl daemon-reload
 ```
 
-不要启用矿工开机启动。模板故意没有 Install 段；App 只允许操作 GPU0、GPU1 两个实例。
+不要启用矿工开机启动。两个 unit 模板故意没有 Install 段；App 分别管理 GPU0、GPU1 和独立 CPU 服务。
 
 1. 每次只迁移一张卡。用原会话的 Ctrl+C 或原有管理方式停止该卡对应的监督器和子矿工；不要使用 `pkill`、`killall` 或按软件名批量停止。
 2. 用 `nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv` 核实目标 GPU 已释放。API 检测到不属于对应 `gpu-pocket-miner@<id>.service` cgroup 的进程会返回 409，不会自动杀进程；不要停止另一张卡上的工作。
@@ -96,17 +101,42 @@ sudo systemctl daemon-reload
 4. 手机在目标 GPU 卡片上选择算法、矿池、可选功耗上限及自己核实过的钱包，暂存后确认应用。
 5. 检查对应实例，例如 `systemctl status gpu-pocket-miner@0.service` 和 `journalctl -u gpu-pocket-miner@0.service`；核实 GPU 分配、钱包、目标矿池及实际接受份额。逐卡功耗参数未经真实矿工环境验证，首次启动应现场观察功耗，确认后再迁移另一张卡。
 
-新服务先进入现有 `research-tun`，再以 `joshua` 执行固定矿工参数。GPU0、GPU1 各自使用独立 systemd 实例与状态文件。它不修改代理订阅、DNS、GPU 驱动或固件。新增矿池由管理员编辑 TOML。
+新服务先进入现有 `research-tun`，再以 `joshua` 执行固定矿工参数。GPU0、GPU1 与 CPU 各自使用独立 systemd 服务与状态文件。它不修改代理订阅、DNS、GPU 驱动或固件。新增矿池由管理员编辑 TOML。
 
-### 仅启用 GPU0 控制
+### 启用 CPU 挖矿
 
-当 GPU1 仍被其他计算任务占用时，可只授权 GPU0 的 systemd 操作。先在开发机按 `tools/remote-check.ps1` 完成 Rust 检查，并生成 release 二进制；将 `gpu-pocket-server`、`deploy/gpu-pocket-miner@.service`、`deploy/gpu-pocket-gpu0.sudoers` 和 `deploy/enable-control-gpu0.sh` 放入服务器同一个暂存目录。确认 GPU0 当前旧矿工已准备好手动切换后，在服务器可信终端以管理员权限执行：
+CPU 使用单独的 `gpu-pocket-cpu.service`，不会与 GPU 服务共用状态或重启。示例配置提供 SRBMiner `randomx` + Monero profile；在真实服务器上先确认 `gpu_root/research-srb-3-8-0/research-srb` 存在，并核实币种、矿池地址、TLS 和钱包格式。其它候选币需管理员为 SRBMiner 支持的精确 CPU 算法各添加 `cpu_profiles` / pools 条目，不能只因 WhatToMine 标记 RandomX 就假定算法变体完全相同。
+
+部署 CPU unit 和最小 sudoers 权限（不会启动服务）：
+
+```bash
+sudo install -m 0644 deploy/gpu-pocket-cpu.service /etc/systemd/system/
+sudo visudo -cf deploy/gpu-pocket-cpu.sudoers
+sudo install -m 0440 -o root -g root deploy/gpu-pocket-cpu.sudoers /etc/sudoers.d/gpu-pocket-cpu
+sudo visudo -c
+sudo systemctl daemon-reload
+```
+
+配置加载后，手机在控制页暂存 CPU profile、矿池、钱包及 1–100% 线程比例（默认 50%），再明确点按启动。SRBMiner 把该百分比定义为 CPU 线程提示，不是严格 CPU 硬限额。首次运行应观察主机 CPU、温度和功耗，并在矿池端确认已接受份额。`systemctl active` 或 API `active` 只证明服务启动，不证明收益或有效算力。API `control_enabled` 为全局写操作开关，打开后 CPU 和 GPU 接口均可写；逐项 sudoers 权限仍需独立安装。
+
+### 启用逐 GPU 控制
+
+GPU0 与 GPU1 使用分开的 sudoers 规则。仅在准备接管相应 GPU 时安装该卡规则；安装权限不会停止旧进程或启动矿工。先在开发机按 `tools/remote-check.ps1` 完成 Rust 检查，并生成 release 二进制；将 `gpu-pocket-server`、`deploy/gpu-pocket-miner@.service`、`deploy/gpu-pocket-gpu0.sudoers`、`deploy/gpu-pocket-api-control.conf` 和 `deploy/enable-control-gpu0.sh` 放入服务器同一个暂存目录。确认 GPU0 旧矿工适合手动切换后，在服务器可信终端以管理员权限执行：
 
 ```bash
 sudo bash /path/to/staging/enable-control-gpu0.sh /path/to/staging
 ```
 
-该脚本备份 API 配置和二进制，安装矿工 unit 与仅限 GPU0 的 sudoers 规则，启用 API 控制并重启用户级 API；**不会停止现有进程、启动矿工或启用矿工开机启动**。GPU0 旧矿工仍在运行时，App 的新矿工启动会因外部 GPU 进程而返回冲突；先在原监督器会话中停止目标 GPU0，再从 App 启动。GPU1 不在 sudoers 允许范围内，且应保持其正在运行的外部任务。不要将管理员密码或令牌粘贴到聊天中。
+该脚本备份 API 配置和二进制，安装矿工 unit 与仅限 GPU0 的 sudoers 规则，启用 API 控制并重启用户级 API；**不会停止现有进程、启动矿工或启用矿工开机启动**。它为 API 用户服务添加 `NoNewPrivileges=no` 覆盖，因为 `NoNewPrivileges=true` 会阻止 `sudo` 的 setuid 提权。为限制风险，sudoers 只允许 API 用户操作明确列出的 GPU miner systemd 单元；不要扩大该命令白名单。GPU0 旧矿工仍在运行时，App 的启动会因外部 GPU 进程而返回冲突；先在原监督器会话中停止目标 GPU0，再从 App 启动。不要将管理员密码或令牌粘贴到聊天中。
+
+若要独立启用 GPU1 的 systemd 控制，将 `deploy/gpu-pocket-gpu1.sudoers` 放入服务器暂存目录，并在可信终端执行：
+
+```bash
+sudo install -o root -g root -m 0440 /path/to/staging/gpu-pocket-gpu1.sudoers /etc/sudoers.d/gpu-pocket-gpu1
+sudo visudo -c
+```
+
+这只增加 GPU1 的 start/restart/stop 权限，不会停止 GPU1 上正在运行的外部任务。必须先在原监督器中停止 GPU1 旧任务，App 才能启动托管矿工；GPU1 上仍有外部任务时，API 会拒绝启动。
 
 systemd 仅在进程退出时重启，不检测“进程仍在但没有新任务／份额”。现有 Python 监督器的保活能力没有被默认继承。需要相同能力时，应先扩展矿工 API 适配器，再决定长期迁移。
 

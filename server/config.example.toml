@@ -22,6 +22,18 @@ label = "Kryptex Hong Kong"
 address = "prl-hk.kryptex.network:7048"
 tls = false
 
+[[cpu_profiles]]
+id = "xmr-randomx"
+label = "Monero (XMR) · RandomX / SRBMiner CPU"
+algorithm = "randomx"
+binary = "research-srb-3-8-0/research-srb"
+
+[[cpu_profiles.pools]]
+id = "kryptex-us"
+label = "Kryptex US"
+address = "xmr-us.kryptex.network:7029"
+tls = false
+
 [[profiles]]
 id = "octopus"
 label = "NiceHash · OCTOPUS / lolMiner"
@@ -30,9 +42,9 @@ binary = "research-octopus-1.98a/research-octopus"
 
 [[profiles.pools]]
 id = "nicehash"
-label = "NiceHash Auto TLS"
-address = "octopus.auto.nicehash.com:443"
-tls = true
+label = "NiceHash Europe"
+address = "octopus.eu.nicehash.com:3389"
+tls = false
 
 [proxy]
 endpoint = "http://127.0.0.1:19097"

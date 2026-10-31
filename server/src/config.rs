@@ -11,6 +11,8 @@ pub struct Config {
     pub control_enabled: bool,
     pub profiles: Vec<Profile>,
     #[serde(default)]
+    pub cpu_profiles: Vec<CpuProfile>,
+    #[serde(default)]
     pub proxy: Option<Proxy>,
 }
 
@@ -31,6 +33,15 @@ pub struct Pool {
     pub tls: bool,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+pub struct CpuProfile {
+    pub id: String,
+    pub label: String,
+    pub algorithm: String,
+    pub binary: PathBuf,
+    pub pools: Vec<Pool>,
+}
+
 #[derive(Clone, Deserialize)]
 pub struct Proxy {
     pub endpoint: String,
@@ -47,6 +58,17 @@ pub struct Selection {
     pub wallet: String,
     #[serde(default)]
     pub power_limit_w: Option<u32>,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CpuSelection {
+    pub profile_id: String,
+    pub pool_id: String,
+    pub wallet: String,
+    #[serde(default = "default_cpu_threads_percent")]
+    pub threads_percent: u32,
     pub revision: u64,
 }
 
@@ -85,6 +107,10 @@ fn default_memory_floor() -> u32 {
 
 fn default_intensity() -> u32 {
     20
+}
+
+fn default_cpu_threads_percent() -> u32 {
+    50
 }
 
 impl GpuPolicy {
@@ -139,6 +165,34 @@ impl Config {
                 }
             }
         }
+        let mut cpu_ids = HashSet::new();
+        for profile in &self.cpu_profiles {
+            if !cpu_ids.insert(&profile.id)
+                || profile.id.is_empty()
+                || profile.id.len() > 64
+                || !profile
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                || profile.algorithm.is_empty()
+                || profile.algorithm.len() > 64
+                || !profile
+                    .algorithm
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            {
+                bail!("invalid or duplicate CPU profile id or algorithm");
+            }
+            if profile.binary.is_absolute()
+                || profile
+                    .binary
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                bail!("CPU binary must be a relative path within gpu_root");
+            }
+            validate_pools(&profile.pools)?;
+        }
         if let Some(proxy) = &self.proxy {
             let url = reqwest::Url::parse(&proxy.endpoint)?;
             if url.scheme() != "http"
@@ -187,6 +241,24 @@ impl Config {
         Ok((profile, pool))
     }
 
+    pub fn resolve_cpu(&self, s: &CpuSelection) -> Result<(&CpuProfile, &Pool)> {
+        validate_wallet(&s.wallet)?;
+        if !(1..=100).contains(&s.threads_percent) {
+            bail!("threads_percent must be between 1 and 100");
+        }
+        let profile = self
+            .cpu_profiles
+            .iter()
+            .find(|p| p.id == s.profile_id)
+            .context("unknown CPU profile")?;
+        let pool = profile
+            .pools
+            .iter()
+            .find(|p| p.id == s.pool_id)
+            .context("pool does not belong to CPU profile")?;
+        Ok((profile, pool))
+    }
+
     pub fn save_selection(&self, name: &str, selection: &Selection) -> Result<()> {
         self.save_json(name, selection)
     }
@@ -229,11 +301,22 @@ impl Config {
         self.save_selection(&file, selection)
     }
 
+    pub fn read_cpu_selection(&self, name: &str) -> Result<CpuSelection> {
+        Ok(serde_json::from_slice(&std::fs::read(
+            self.state_dir.join(format!("cpu-{name}.json")),
+        )?)?)
+    }
+
+    pub fn save_cpu_selection(&self, name: &str, selection: &CpuSelection) -> Result<()> {
+        self.save_json(&format!("cpu-{name}.json"), selection)
+    }
+
     pub fn read_gpu_policy(&self, gpu_id: u32) -> Result<GpuPolicy> {
         let file = self.state_dir.join(format!("gpu{gpu_id}-policy.json"));
         if !file.exists() {
             return Ok(GpuPolicy::new(gpu_id));
         }
+
         let policy: GpuPolicy = serde_json::from_slice(&std::fs::read(file)?)?;
         if policy.gpu_id != gpu_id {
             bail!("policy GPU id does not match its file");
@@ -256,4 +339,34 @@ impl Config {
     pub fn save_gpu_mode(&self, gpu_id: u32, mode: GpuMode) -> Result<()> {
         self.save_json(&format!("gpu{gpu_id}-mode.json"), &mode)
     }
+}
+
+fn validate_pools(pools: &[Pool]) -> Result<()> {
+    let mut ids = HashSet::new();
+    for pool in pools {
+        if !ids.insert(&pool.id)
+            || pool.address.starts_with('-')
+            || !pool.address.contains(':')
+            || !pool
+                .address
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(&b))
+        {
+            bail!("invalid pool address or duplicate pool id");
+        }
+    }
+    Ok(())
+}
+
+fn validate_wallet(wallet: &str) -> Result<()> {
+    if wallet.is_empty()
+        || wallet.len() > 256
+        || wallet.starts_with('-')
+        || !wallet
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+    {
+        bail!("wallet must be 1..256 ASCII letters, digits or ._:- and cannot start with '-'");
+    }
+    Ok(())
 }
