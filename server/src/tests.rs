@@ -23,6 +23,7 @@ fn fixture() -> (App, tempfile::TempDir) {
         demo_node: Arc::new(Mutex::new("DEMO-HK".into())),
         runtime: Arc::new(Mutex::new(BTreeMap::new())),
         process_watch: Arc::new(Mutex::new(ProcessWatchState::default())),
+        cpu_usage: Arc::new(Mutex::new(None)),
         push: Arc::new(crate::push::PushService::new(
             dir.path().to_path_buf(),
             reqwest::Client::new(),
@@ -267,6 +268,18 @@ async fn cpu_mining_is_independent_and_defaults_to_half_threads() {
 }
 
 #[tokio::test]
+async fn catalog_reports_public_miner_capabilities() {
+    let (app, _dir) = fixture();
+    let (status, catalog) = call(&app, "GET", "/api/v1/catalog", Value::Null).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(catalog["profiles"][0]["id"], "pearl");
+    assert_eq!(catalog["profiles"][0]["miner"], "srb-pearl");
+    assert_eq!(catalog["profiles"][1]["miner"], "lol-octopus");
+    assert!(catalog["profiles"][0].get("binary").is_none());
+}
+
+#[tokio::test]
 async fn gpu_scoped_selections_and_services_are_independent() {
     let (app, _dir) = fixture();
     for (gpu_id, profile_id, pool_id, power_limit_w) in
@@ -425,30 +438,87 @@ async fn policies_are_per_gpu_validated_and_disabled_by_default() {
 }
 
 #[tokio::test]
-async fn policy_accepts_and_bounds_srb_intensity() {
+async fn gpu_intensity_is_optional_and_bounded_on_startup() {
     let (app, _dir) = fixture();
-    let (status, _) = call(
-        &app,
-        "PUT",
-        "/api/v1/gpus/0/policy",
-        json!({
-            "gpu_id":0,
-            "enabled":true,
-            "throttle_enabled":false,
-            "night_mode_enabled":false,
-            "external_task_monitor":false,
-            "min_free_memory_mib":2048,
-            "power_limit_w":250,
-            "intensity":32
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let mut policy = serde_json::to_value(GpuPolicy::new(0)).unwrap();
-    policy["intensity"] = json!(20);
     assert_eq!(
-        call(&app, "PUT", "/api/v1/gpus/0/policy", policy).await.0,
+        call(
+            &app,
+            "PUT",
+            "/api/v1/selection",
+            json!({
+                "profile_id":"pearl",
+                "pool_id":"sg",
+                "wallet":"testWallet.worker",
+                "revision":0
+            })
+        )
+        .await
+        .0,
         StatusCode::OK
+    );
+    for intensity in [0, 32] {
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/api/v1/miner",
+                json!({"operation":"restart","revision":1,"gpu_intensity":intensity})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/api/v1/miner",
+            json!({"operation":"restart","revision":1,"gpu_intensity":1})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.config
+            .read_gpu_selection("applied", 0)
+            .unwrap()
+            .gpu_intensity,
+        Some(1)
+    );
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/api/v1/miner",
+            json!({"operation":"restart","revision":1})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.config
+            .read_gpu_selection("applied", 0)
+            .unwrap()
+            .gpu_intensity,
+        None
+    );
+}
+
+#[test]
+fn legacy_throttle_mode_migrates_to_normal() {
+    let (app, _dir) = fixture();
+    std::fs::write(
+        app.config.state_dir.join("gpu0-mode.json"),
+        "\"throttle\"",
+    )
+    .unwrap();
+    assert_eq!(app.config.read_gpu_mode(0).unwrap(), GpuMode::Normal);
+    assert_eq!(
+        std::fs::read_to_string(app.config.state_dir.join("gpu0-mode.json")).unwrap(),
+        "\"normal\""
     );
 }
 

@@ -1,5 +1,6 @@
 # Copy to /etc/gpu-pocket/server.toml. Keep production control disabled until takeover.
 listen = "127.0.0.1:8787"
+host_name = "gpu-server"
 gpu_root = "/media/new_data3/Tongji-Wang/gpu"
 state_dir = "/var/lib/gpu-pocket"
 control_enabled = false

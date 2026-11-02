@@ -35,6 +35,7 @@ struct App {
     demo_node: Arc<Mutex<String>>,
     runtime: Arc<Mutex<BTreeMap<u32, RuntimeState>>>,
     process_watch: Arc<Mutex<ProcessWatchState>>,
+    cpu_usage: Arc<Mutex<Option<(u64, u64)>>>,
     push: Arc<push::PushService>,
     client: reqwest::Client,
 }
@@ -48,6 +49,7 @@ struct ProcessWatchState {
 #[derive(Default)]
 struct RuntimeState {
     low_util_since: Option<Instant>,
+    idle_since: Option<Instant>,
     external_task: bool,
     memory_blocked: bool,
     last_message: Option<String>,
@@ -116,6 +118,47 @@ fn unit_name(gpu_id: u32) -> Result<String> {
 
 const CPU_UNIT: &str = "gpu-pocket-cpu.service";
 
+#[derive(Default)]
+struct CpuUsageSample {
+    total: u64,
+    idle: u64,
+}
+
+fn read_cpu_usage() -> Result<CpuUsageSample> {
+    let mut total = 0u64;
+    let mut idle = 0u64;
+    let first = std::fs::read_to_string("/proc/stat")?
+        .lines()
+        .next()
+        .context("missing aggregate /proc/stat row")?
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|value| value.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    for (index, value) in first.iter().enumerate() {
+        total = total.saturating_add(*value);
+        if index == 3 || index == 4 {
+            idle = idle.saturating_add(*value);
+        }
+    }
+    Ok(CpuUsageSample { total, idle })
+}
+
+async fn cpu_usage_percent(app: &App) -> Option<u32> {
+    let current = match read_cpu_usage() {
+        Ok(value) => value,
+        Err(_) => return None,
+    };
+    let mut previous = app.cpu_usage.lock().await;
+    let percent = previous.as_ref().map(|sample: &(u64, u64)| {
+        let total_delta = current.total.saturating_sub(sample.0);
+        let idle_delta = current.idle.saturating_sub(sample.1);
+        if total_delta == 0 { None } else { Some((100u64.saturating_mul(total_delta.saturating_sub(idle_delta)) / total_delta) as u32) }
+    }).flatten();
+    *previous = Some((current.total, current.idle));
+    percent
+}
+
 async fn cpu_service_state(app: &App) -> Result<String> {
     if app.demo {
         return Ok(if app.demo_cpu_active.lock().await.is_some() {
@@ -125,13 +168,23 @@ async fn cpu_service_state(app: &App) -> Result<String> {
         }
         .into());
     }
-    Ok(gpu::output(
+    let service = gpu::output(
         "/usr/bin/systemctl",
         &["show", CPU_UNIT, "--property=ActiveState", "--value"],
     )
     .await?
     .trim()
-    .into())
+    .to_string();
+    if service != "active" {
+        if let Ok(processes) = gpu::output("/usr/bin/pgrep", &["-af", "research-srb|srbminer"]).await {
+            if !processes.trim().is_empty()
+                && processes.lines().any(|line| line.contains("--algorithm-cpu") && !line.contains("gpu-pocket-server"))
+            {
+                return Ok("active".into());
+            }
+        }
+    }
+    Ok(service)
 }
 
 async fn service_state(app: &App, gpu_id: u32) -> Result<String> {
@@ -225,6 +278,26 @@ async fn status(State(app): State<App>) -> ApiResult {
                 .filter(|process| process.gpu_id == gpu_id)
                 .collect::<Vec<_>>()
         });
+        let has_external_or_process = external_pids
+            .as_ref()
+            .is_some_and(|pids| !pids.is_empty())
+            || processes.as_ref().is_some_and(|items| !items.is_empty());
+        let gpu_utilization_low = gpus
+            .iter()
+            .find(|gpu| gpu.index == gpu_id)
+            .and_then(|gpu| gpu.utilization)
+            .is_some_and(|utilization| utilization < 5.0);
+        let idle_seconds = {
+            let mut runtime = app.runtime.lock().await;
+            let state = runtime.entry(gpu_id).or_default();
+            if gpu_utilization_low && !has_external_or_process {
+                let since = state.idle_since.get_or_insert_with(Instant::now);
+                Some(since.elapsed().as_secs())
+            } else {
+                state.idle_since = None;
+                None
+            }
+        };
         gpu_controls.insert(
             gpu_id.to_string(),
             json!({
@@ -232,7 +305,8 @@ async fn status(State(app): State<App>) -> ApiResult {
                 "desired":desired,
                 "active":active,
                 "external_pids":external_pids,
-                "processes":processes
+                "processes":processes,
+                "idle_seconds":idle_seconds
             }),
         );
         let policy = match app.config.read_gpu_policy(gpu_id) {
@@ -287,19 +361,23 @@ async fn status(State(app): State<App>) -> ApiResult {
     } else if cpu_service == "active" {
         match app.config.read_cpu_selection("active") {
             Ok(selection) => Some(selection),
-            Err(error) => {
-                errors.push(format!("CPU active selection: {error}"));
-                None
-            }
+            Err(_) => match app.config.read_cpu_selection("applied") {
+                Ok(selection) => Some(selection),
+                Err(error) => {
+                    errors.push(format!("CPU active selection: {error}"));
+                    None
+                }
+            },
         }
     } else {
         None
     };
+    let cpu_usage_percent = cpu_usage_percent(&app).await;
     Ok(Json(
-        json!({"host": "2-titan", "demo": app.demo, "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        json!({"host": app.config.host_name.clone(), "demo": app.demo, "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         "gpus": gpus, "service": service, "desired": desired, "active": active,
         "gpu_controls":gpu_controls,"policies":policies,
-        "cpu_mining":{"service":cpu_service,"desired":cpu_desired,"active":cpu_active},
+        "cpu_mining":{"service":cpu_service,"desired":cpu_desired,"active":cpu_active,"usage_percent":cpu_usage_percent},
         "push_configured":app.push.configured(),
         "control_enabled": app.config.control_enabled, "errors": errors}),
     ))
@@ -325,7 +403,7 @@ async fn catalog(State(app): State<App>) -> ApiResult {
         .config
         .profiles
         .iter()
-        .map(|p| json!({"id":p.id,"label":p.label,"pools":p.pools}))
+        .map(|p| json!({"id":p.id,"label":p.label,"miner":p.miner,"pools":p.pools}))
         .collect();
     let cpu_profiles: Vec<_> = app
         .config
@@ -460,6 +538,9 @@ async fn save_gpu(
 async fn save_for_gpu(app: App, gpu_id: u32, mut selected: Selection) -> ApiResult {
     writable(&app)?;
     unit_name(gpu_id).map_err(bad)?;
+    if selected.gpu_intensity.is_some() {
+        return Err(bad("gpu_intensity must be set when starting or restarting"));
+    }
     if selected.gpu_id != gpu_id {
         return Err(bad("gpu_id does not match the request path"));
     }
@@ -467,7 +548,7 @@ async fn save_for_gpu(app: App, gpu_id: u32, mut selected: Selection) -> ApiResu
     let (profile, _) = app.config.resolve(&selected).map_err(bad)?;
     let policy = app.config.read_gpu_policy(gpu_id)?;
     if policy.enabled
-        && (policy.throttle_enabled || policy.night_mode_enabled)
+        && policy.night_mode_enabled
         && profile.miner != "srb-pearl"
     {
         return Err(bad(
@@ -540,18 +621,18 @@ async fn save_policy(
         return Err(bad("gpu_id does not match the request path"));
     }
     if policy.intensity > 31 {
-        return Err(bad("SRBMiner intensity must be between 0 and 31"));
+        return Err(bad("legacy policy intensity must be between 0 and 31"));
     }
     if !(512..=16_384).contains(&policy.min_free_memory_mib) {
         return Err(bad("min_free_memory_mib must be between 512 and 16384"));
     }
-    if policy.throttle_enabled || policy.night_mode_enabled {
+    if policy.night_mode_enabled {
         let selection = read_desired(&app, gpu_id)?
             .ok_or_else(|| bad("save a GPU selection before enabling automation"))?;
         let (profile, _) = app.config.resolve(&selection).map_err(bad)?;
         if profile.miner != "srb-pearl" {
             return Err(bad(
-                "automatic throttle and night modes currently require SRBMiner Pearl",
+                "automatic night mode currently requires SRBMiner Pearl",
             ));
         }
     }
@@ -718,9 +799,18 @@ async fn notify_policy(app: &App, gpu_id: u32, title: &str, body: &str) {
 
 async fn auto_action(app: &App, gpu_id: u32, operation: Operation, mode: GpuMode) -> Result<()> {
     let selection = read_desired(app, gpu_id)?.context("no staged GPU selection")?;
+    let gpu_intensity = if operation == Operation::Stop {
+        None
+    } else {
+        app.config
+            .read_optional_gpu_selection("applied", gpu_id)?
+            .filter(|applied| applied.profile_id == selection.profile_id)
+            .and_then(|applied| applied.gpu_intensity)
+    };
     let action = Action {
         operation,
         revision: selection.revision,
+        gpu_intensity,
     };
     let _ = action_for_gpu(app.clone(), gpu_id, action, mode)
         .await
@@ -757,8 +847,7 @@ async fn policy_tick(app: &App) -> Result<()> {
         let night = policy.night_mode_enabled && is_china_night(now)?;
         let night_only_memory = night || current_mode == GpuMode::Night;
         let monitor_external = !night_only_memory
-            && (current_mode == GpuMode::Throttle
-                || (policy.enabled && (policy.external_task_monitor || policy.throttle_enabled)));
+            && (policy.enabled && (policy.external_task_monitor || policy.throttle_enabled));
         let unmanaged_result = if app.demo || !monitor_external {
             Ok(Vec::new())
         } else {
@@ -913,19 +1002,19 @@ async fn policy_tick(app: &App) -> Result<()> {
 
         if policy.throttle_enabled
             && low_util_seconds >= 30 * 60
-            && (service != "active" || current_mode != GpuMode::Throttle)
+            && (service != "active" || current_mode != GpuMode::Normal)
         {
             let operation = if service == "active" {
                 Operation::Restart
             } else {
                 Operation::Start
             };
-            auto_action(app, gpu_id, operation, GpuMode::Throttle).await?;
+            auto_action(app, gpu_id, operation, GpuMode::Normal).await?;
             notify_policy(
                 app,
                 gpu_id,
-                "GPU Pocket 节制模式",
-                &format!("GPU{gpu_id} 利用率低于 5% 已持续 30 分钟，已启动节制挖矿。"),
+                "GPU Pocket 自启模式",
+                &format!("GPU{gpu_id} 利用率低于 5% 已持续 30 分钟，已启动正常挖矿。"),
             )
             .await;
         }
@@ -933,13 +1022,15 @@ async fn policy_tick(app: &App) -> Result<()> {
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Action {
     operation: Operation,
     revision: u64,
+    #[serde(default)]
+    gpu_intensity: Option<u32>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Operation {
     Start,
@@ -970,14 +1061,35 @@ async fn action_for_gpu(app: App, gpu_id: u32, action: Action, mode: GpuMode) ->
             "selection changed; refresh before applying".into(),
         ));
     }
+    if let Some(intensity) = action.gpu_intensity {
+        if !(1..=31).contains(&intensity) {
+            return Err(bad("SRBMiner GPU intensity must be between 1 and 31"));
+        }
+        if matches!(action.operation, Operation::Stop) {
+            return Err(bad("GPU intensity can only be set when starting or restarting"));
+        }
+        let selected = selection.as_ref().ok_or_else(|| bad("save a GPU selection first"))?;
+        let (profile, _) = app.config.resolve(selected).map_err(bad)?;
+        if profile.miner != "srb-pearl" {
+            return Err(bad("GPU intensity is only supported by SRBMiner Pearl"));
+        }
+    }
     let operation = match action.operation {
         Operation::Start => "start",
         Operation::Restart => "restart",
         Operation::Stop => "stop",
     };
+    let active = if operation == "stop" {
+        "inactive".to_string()
+    } else {
+        service_state(&app, gpu_id).await?
+    };
+    if action.gpu_intensity.is_some() && operation == "start" && active == "active" {
+        return Err(bad("use restart to apply a GPU intensity to an active miner"));
+    }
     let mode_to_apply = if operation == "stop" {
         GpuMode::Normal
-    } else if operation == "restart" || service_state(&app, gpu_id).await? != "active" {
+    } else if operation == "restart" || active != "active" {
         mode
     } else {
         app.config.read_gpu_mode(gpu_id)?
@@ -987,9 +1099,8 @@ async fn action_for_gpu(app: App, gpu_id: u32, action: Action, mode: GpuMode) ->
         let s = selection
             .as_ref()
             .ok_or_else(|| bad("save a selection first"))?;
-        app.config.resolve(s).map_err(bad)?;
+        let (profile, _) = app.config.resolve(s).map_err(bad)?;
         if !app.demo {
-            let (profile, _) = app.config.resolve(s).map_err(bad)?;
             let path = app
                 .config
                 .gpu_root
@@ -1014,9 +1125,10 @@ async fn action_for_gpu(app: App, gpu_id: u32, action: Action, mode: GpuMode) ->
         if operation == "stop" {
             active.remove(&gpu_id);
         } else if operation == "restart" || !active.contains_key(&gpu_id) {
-            app.config
-                .save_gpu_selection("applied", selection.as_ref().unwrap())?;
-            active.insert(gpu_id, selection.unwrap());
+            let mut applied = selection.clone().unwrap();
+            applied.gpu_intensity = action.gpu_intensity;
+            app.config.save_gpu_selection("applied", &applied)?;
+            active.insert(gpu_id, applied);
         }
     } else {
         // Automatic systemd recovery must reuse the last explicitly applied version.
@@ -1024,8 +1136,9 @@ async fn action_for_gpu(app: App, gpu_id: u32, action: Action, mode: GpuMode) ->
         if operation != "stop"
             && (operation == "restart" || service_state(&app, gpu_id).await? != "active")
         {
-            app.config
-                .save_gpu_selection("applied", selection.as_ref().unwrap())?;
+            let mut applied = selection.clone().unwrap();
+            applied.gpu_intensity = action.gpu_intensity;
+            app.config.save_gpu_selection("applied", &applied)?;
         }
         gpu::output(
             "/usr/bin/sudo",
@@ -1183,6 +1296,9 @@ fn launch(config: &Config, gpu_id: u32) -> Result<()> {
         bail!("applied selection does not match the miner GPU");
     }
     let (profile, pool) = config.resolve(&selection)?;
+    if selection.gpu_intensity.is_some() && profile.miner != "srb-pearl" {
+        bail!("GPU intensity is only supported by SRBMiner Pearl");
+    }
     let mode = config.read_gpu_mode(gpu_id)?;
     let policy = config.read_gpu_policy(gpu_id)?;
     let binary = ensure_miner_binary(config, &profile.binary)?;
@@ -1212,8 +1328,7 @@ fn launch(config: &Config, gpu_id: u32) -> Result<()> {
             &api_port,
         ]);
         let power_limit_w = match mode {
-            GpuMode::Normal => selection.power_limit_w,
-            GpuMode::Throttle => policy.power_limit_w,
+            GpuMode::Normal | GpuMode::Throttle => selection.power_limit_w,
             GpuMode::Night => None,
         };
         if let Some(power_limit_w) = power_limit_w {
@@ -1221,8 +1336,11 @@ fn launch(config: &Config, gpu_id: u32) -> Result<()> {
             let power_value = power_limit_w.to_string();
             command.args([power_argument.as_str(), power_value.as_str()]);
         }
-        if mode == GpuMode::Throttle {
-            command.args(["--gpu-intensity", &policy.intensity.to_string()]);
+        if let Some(intensity) = selection.gpu_intensity {
+            if !(1..=31).contains(&intensity) {
+                bail!("SRBMiner GPU intensity must be between 1 and 31");
+            }
+            command.args(["--gpu-intensity", &intensity.to_string()]);
         }
     } else {
         command.args([
@@ -1322,6 +1440,7 @@ async fn main() -> Result<()> {
         demo_node: Arc::new(Mutex::new("DEMO-HK".into())),
         runtime: Arc::new(Mutex::new(BTreeMap::new())),
         process_watch: Arc::new(Mutex::new(ProcessWatchState::default())),
+        cpu_usage: Arc::new(Mutex::new(None)),
         push,
         client,
     };

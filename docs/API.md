@@ -3,13 +3,13 @@
 所有接口均要求 `Authorization: Bearer <GPU_POCKET_TOKEN>`。包括监控接口在内，没有公开状态端点。JSON 请求体上限为 4096 字节。服务端不启用浏览器跨域访问；原生 Flutter 不依赖 CORS。
 
 - `GET /api/v1/status`：返回 `demo`、采样时间戳、`gpus`、控制开关、`push_configured`、采样／状态文件错误列表，以及 `gpu_controls`、`policies` 和 `cpu_mining`。`gpu_controls` 每项含 `service`、暂存的 `desired`、运行记录 `active`、`external_pids` 和 `processes`；进程项含 PID、类型、名称、显存用量、可执行文件路径及其是否位于 `gpu_root` 下。Xorg 不显示。进程列表不可用时为 `null` 并附带错误，而不是空闲。`policies` 每项含策略、运行模式和自动化计时／保护状态。`cpu_mining` 含 CPU 专属 `service`、`desired` 和 `active` 状态。旧的顶层 `service`、`desired`、`active` 字段继续映射 GPU0。`gpus` 为空且 `errors` 非空表示采样失败，不表示空闲。
-- `GET /api/v1/catalog`：返回允许的 GPU/CPU 算法配置和对应矿池。不会返回二进制路径或代理控制器秘密。
+- `GET /api/v1/catalog`：返回允许的 GPU/CPU 算法配置和对应矿池；GPU profile 提供公开的 `miner` 类型供客户端判断能力。不会返回二进制路径或代理控制器秘密。
 - `PUT /api/v1/gpus/{gpu_id}/selection`：分别暂存 GPU0 或 GPU1 配置。请求包含匹配路径的 `gpu_id`、`profile_id`、`pool_id`、`wallet`、可选 `power_limit_w` 和 `revision`。功耗上限必须在该卡当前 nvidia-smi 范围内；不可用时拒绝设置。revision 必须等于该 GPU 当前暂存版本；首次为 0。服务端保存后加 1。此操作不重启矿工。
-- `POST /api/v1/gpus/{gpu_id}/miner`：请求为 `{"operation":"restart","revision":1}`。operation 仅支持 `start`、`restart`、`stop`。start 对已运行的实例保持 systemd 原有行为；应用新配置应使用 restart。revision 必须匹配，避免多台手机覆盖操作。
+- `POST /api/v1/gpus/{gpu_id}/miner`：请求为 `{"operation":"restart","revision":1}`，可选 `gpu_intensity`（SRBMiner Pearl 算法强度，1–31）。留空或传 `null` 使用 SRBMiner 默认值；设置后只在启动／重启时应用，并随 applied 配置供 systemd 恢复使用。其他矿工不支持该参数。operation 仅支持 `start`、`restart`、`stop`。start 对已运行的实例保持 systemd 原有行为；对运行中的实例设置强度必须使用 restart。revision 必须匹配，避免多台手机覆盖操作。
 - `PUT /api/v1/cpu/selection`：暂存 CPU `profile_id`、`pool_id`、`wallet`、`threads_percent` 与 `revision`。线程比例限制为 1–100，首次 revision 为 0；未传比例时默认为 50。修改不影响 GPU 选择，也不会立即启动矿工。
 - `POST /api/v1/cpu/miner`：以 `{"operation":"start","revision":1}` 启动独立 `gpu-pocket-cpu.service`；同样支持 `restart`、`stop`。服务端只使用 TOML 白名单中的 CPU 算法、矿池和二进制，不接收任意命令。SRBMiner 的线程比例是 worker-thread hint，不保证为操作系统级硬 CPU 限额。
 - `GET /api/v1/gpus/{gpu_id}/policy`：读取该卡自动策略和当前运行模式。
-- `PUT /api/v1/gpus/{gpu_id}/policy`：写入该卡策略（字段为 `gpu_id`、`enabled`、`throttle_enabled`、`night_mode_enabled`、`external_task_monitor`、`min_free_memory_mib`、`power_limit_w`、`intensity`）。SRBMiner `intensity` 限制为 0–31，默认 20。全局 `control_enabled` 和每卡 `enabled` 都必须打开自动控制才会运行。自动节制／深夜目前仅支持 Pearl / SRBMiner；可用显存低于阈值或无法采样时自动暂停，显存阈值是轮询停矿保护，不是矿工硬上限。节制在利用率低于 5% 持续 30 分钟后启动，并使用设置的功耗上限和算法强度；深夜时间为北京时间 01:00–08:00，期间忽略计算占用和外部进程，只按显存阈值保护。
+- `PUT /api/v1/gpus/{gpu_id}/policy`：写入该卡自动策略（字段为 `gpu_id`、`enabled`、`throttle_enabled`、`night_mode_enabled`、`external_task_monitor`、`min_free_memory_mib`）。旧版 `power_limit_w`、`intensity` 字段仍为兼容保留，但不再控制小规模运行；SRBMiner 强度由 miner action 的 `gpu_intensity` 设置。全局 `control_enabled` 和每卡 `enabled` 都必须打开自动控制才会运行。自启模式在利用率低于 5% 持续 30 分钟后启动正常挖矿；深夜时间为北京时间 01:00–08:00，期间忽略计算占用和外部进程，只按显存阈值保护。可用显存低于阈值或无法采样时自动暂停，显存阈值是轮询停矿保护，不是矿工硬上限。
 - `PUT /api/v1/push/token`、`DELETE /api/v1/push/token`：注册／注销手机 Firebase Messaging 设备令牌。接口可在 Firebase 服务端凭据未配置时登记令牌；此时 `push_configured` 为 false，通知不会投递。
 - 旧 `PUT /api/v1/selection` 与 `POST /api/v1/miner` 路由保留为 GPU0 兼容入口。
 - `GET /api/v1/proxy`：返回固定代理组的类型、当前节点、成员和 `selectable`。未配置控制器秘密时返回 503。

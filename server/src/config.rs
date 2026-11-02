@@ -5,6 +5,8 @@ use std::{collections::HashSet, path::PathBuf};
 #[derive(Clone, Deserialize)]
 pub struct Config {
     pub listen: String,
+    #[serde(default = "default_host_name")]
+    pub host_name: String,
     pub gpu_root: PathBuf,
     pub state_dir: PathBuf,
     #[serde(default)]
@@ -58,6 +60,8 @@ pub struct Selection {
     pub wallet: String,
     #[serde(default)]
     pub power_limit_w: Option<u32>,
+    #[serde(default)]
+    pub gpu_intensity: Option<u32>,
     pub revision: u64,
 }
 
@@ -99,6 +103,10 @@ pub enum GpuMode {
     Normal,
     Throttle,
     Night,
+}
+
+fn default_host_name() -> String {
+    "gpu-server".to_string()
 }
 
 fn default_memory_floor() -> u32 {
@@ -292,6 +300,23 @@ impl Config {
         )?)?)
     }
 
+    pub fn read_optional_gpu_selection(
+        &self,
+        name: &str,
+        gpu_id: u32,
+    ) -> Result<Option<Selection>> {
+        let file = if gpu_id == 0 {
+            format!("{name}.json")
+        } else {
+            format!("gpu{gpu_id}-{name}.json")
+        };
+        match std::fs::read(self.state_dir.join(file)) {
+            Ok(data) => Ok(Some(serde_json::from_slice(&data)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn save_gpu_selection(&self, name: &str, selection: &Selection) -> Result<()> {
         let file = if selection.gpu_id == 0 {
             format!("{name}.json")
@@ -333,7 +358,12 @@ impl Config {
         if !file.exists() {
             return Ok(GpuMode::Normal);
         }
-        Ok(serde_json::from_slice(&std::fs::read(file)?)?)
+        let mode: GpuMode = serde_json::from_slice(&std::fs::read(file)?)?;
+        if mode == GpuMode::Throttle {
+            self.save_gpu_mode(gpu_id, GpuMode::Normal)?;
+            return Ok(GpuMode::Normal);
+        }
+        Ok(mode)
     }
 
     pub fn save_gpu_mode(&self, gpu_id: u32, mode: GpuMode) -> Result<()> {

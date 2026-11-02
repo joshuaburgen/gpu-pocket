@@ -1,14 +1,24 @@
 # GPU Pocket 项目交接报告
 
-更新日期：2026-10-31
+更新日期：2026-11-02
 
 ## 1. 项目状态摘要
 
-GPU Pocket 由 Linux Rust API 和 Flutter Android 客户端组成。当前已完成 GPU0/GPU1 状态与控制、GPU 进程展示、目录外新进程告警、手机端竖屏和 FCM 状态分层。Rust 与 Flutter 的针对性检查已通过。
+GPU Pocket 由 Linux Rust API 和 Flutter Android 客户端组成。当前支持 GPU0/GPU1 状态与控制、GPU 进程展示、目录外新进程告警、手机端竖屏、FCM 状态分层，以及 SRBMiner 启动前可选算法强度（1–31）。小规模强度用可选开关和 Slider 设置；留空时不传参数，由 SRBMiner 使用默认值。
 
 FCM 目前只验证到“服务端请求被 Firebase FCM HTTP v1 接受”，**尚未验证 Android 手机实际显示通知**。不能把服务器凭据配置、Token 登记或 FCM 接受消息当作端到端通知成功。
 
 本报告记录工作区中尚未提交的开发与部署工作。不要在交接时清理、重置或覆盖这些改动。
+
+### 最新工作区状态（2026-11-02）
+
+- 监控卡片中重复显示的 `GPU0 · active` / `GPU1 · active` 小字已移除；卡片内已有状态面板保留。
+- 强度控制曾因 `/api/v1/catalog` 未返回 GPU profile 的 `miner` 类型，导致客户端把 SRBMiner profile 判断为不支持；API 现返回公开 `miner` 类型，客户端以该字段显示 Slider。不要把二进制路径或代理凭据放入 catalog。
+- zww 的 `research-tun-network`、`research-tun-proxy`、`research-tun` 均已启动；代理 YAML 中修复了拼接的节点/组字段及重复代理名。最终验证：配置检查通过、三个 unit 均 active、`research-tun` 默认路由经 `rt-peer`，命名空间 HTTPS 测试通过。未启动 GPU miner，也未停止现有 API/CPU 服务。
+- 最新 APK 构建位置：`mobile/build/app/outputs/flutter-apk/app-release.apk`，2026-11-02 19:04 构建，19:13 安装到 Redmi 2407FRK8EC，ADB 确认安装成功。
+- 本次验证：Flutter API tests 通过；Rust 19 项测试、`cargo fmt --check` 通过。Flutter analyze 仍有 13 条既有 warning/info；完整 widget 测试此前有首屏连接文案断言失败。
+- 2026-11-02 zww GPU0 短测：通过 API 启动 Pearl 矿工 25 秒后停止，服务最终 inactive。进程确实处于 `research-tun` netns；测试期间未观察到该进程的已建立 TCP socket，故只验证 namespace 绑定，不代表矿池连接或 share 验收成功。namespace 独立 HTTPS 检查成功。
+- 更新后的 API binary 已部署到 zww system service 和 2-titan user service；两台主机的 `/api/v1/catalog` 均已核实返回 `pearl:srb-pearl`、`octopus:lol-octopus`，API 服务 active。旧 binary 回滚副本分别保存在 `/opt/gpu-pocket/gpu-pocket-server.pre-slider-20261102` 和 `/media/new_data3/.local/share/gpu-pocket/gpu-pocket-server.pre-slider-20261102`。部署只重启 API，没有改动 GPU unit；zww GPU0 当前 inactive，2-titan GPU0 当前 active。
 
 ### Krig 升级状态（2026-10-31）
 
@@ -165,13 +175,10 @@ Google Play 服务包已安装且启用；设备是 Redmi K70 至尊版，Androi
 
 ## 7. 工作区交接注意事项
 
-交接时工作区存在未提交改动，至少包括：
-
-- 修改：`deploy/enable-control-gpu0.sh`、`docs/API.md`、`docs/DEPLOYMENT.md`、`mobile/README.md`、`mobile/android/app/src/main/AndroidManifest.xml`、`mobile/android/gradle.properties`、`mobile/lib/main.dart`、`server/src/gpu.rs`、`server/src/main.rs`、`server/src/push.rs`、`server/src/tests.rs`。
-- 未跟踪：`deploy/gpu-pocket-api-control.conf`、`deploy/gpu-pocket-gpu1.sudoers`。
-- 本交接报告为新增文件 `docs/HANDOFF.md`。
-
-以上清单来自交接时的 Git 状态；继续工作前应重新检查 `git status`，并保留其他协作者的变更。不要因为这些改动未提交而执行 reset、checkout/restore 或清理。
+- 继续前运行 `git status --short`。本机工作区曾包含敏感的本地凭据文件及远端工具/截图等未跟踪文件；这些文件不得暂存或提交。提交时只选择经过检查的源码、文档和依赖锁文件。
+- 保留其他协作者和先前会话的改动；不要使用 reset、checkout/restore 或宽泛清理命令。
+- Rust API catalog 增加 `miner` 是为手机识别 SRBMiner 能力；若新 APK 连到尚未更新的 API，Slider 仍不会显示。发布客户端之前确认两台服务器 API binary 均包含该字段并通过 `GET /api/v1/catalog` 核对；升级服务前备份 binary、确认 unit 名称，升级后检查 API 和矿工 unit。
+- 自动化策略仍是自启（GPU 利用率低于 5% 持续 30 分钟后正常挖矿）和深夜模式；手动 SRBMiner 强度不属于自动策略。改强度需通过 miner action 重启应用。
 
 ## 8. 凭据与隐私要求
 
