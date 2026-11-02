@@ -7,26 +7,24 @@ import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'api.dart';
+import 'wallet_accounts.dart';
 
 void main() => runApp(const GpuPocketApp());
 
-String _kryptexWallet(int gpuId) => '';
-
-String _niceHashWallet(int gpuId) => '';
+Color? activeGpuModeColor(String? service, String? mode) {
+  if (service != 'active') return null;
+  return mode == 'throttle' || mode == 'manual_throttle'
+      ? Colors.purpleAccent
+      : Colors.green;
+}
 
 class _GpuDraft {
   String? profileId;
   String? poolId;
   final wallet = TextEditingController();
-  final powerLimit = TextEditingController();
-  bool useGpuIntensity = false;
-  double gpuIntensity = 16;
   bool dirty = false;
 
-  void dispose() {
-    wallet.dispose();
-    powerLimit.dispose();
-  }
+  void dispose() => wallet.dispose();
 }
 
 class _GpuPolicyDraft {
@@ -35,6 +33,7 @@ class _GpuPolicyDraft {
   bool nightModeEnabled = false;
   bool externalTaskMonitor = false;
   final minFreeMemory = TextEditingController(text: '2048');
+  double intensity = 10;
   bool dirty = false;
 
   void dispose() => minFreeMemory.dispose();
@@ -85,8 +84,10 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
   final _token2 = TextEditingController();
   final _sharedPoolId = TextEditingController();
   final _sharedWallet = TextEditingController();
+  final _aiTask = TextEditingController();
   String? _sharedGpuProfileId;
   String? _sharedCpuProfileId;
+  String? _sharedWalletPreset;
   final Map<int, _GpuDraft> _gpuDrafts = {};
   final Map<int, _GpuDraft> _gpuDrafts2 = {};
   final Map<int, _GpuPolicyDraft> _policyDrafts = {};
@@ -105,7 +106,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
   StreamSubscription<RemoteMessage>? _foregroundMessageSubscription;
   DateTime? _lastSuccess;
   Timer? _timer;
-  int _tab = 0, _generation = 0;
+  int _tab = 2, _generation = 0;
   bool _loading = false, _working = false;
 
   @override
@@ -152,6 +153,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       _token2.text = token2 ?? '';
       _sharedPoolId.text = sharedPool ?? '';
       _sharedWallet.text = sharedWallet ?? '';
+      _sharedWalletPreset = walletPresetFor(_sharedWallet.text);
       _sharedGpuProfileId = sharedGpuProfile;
       _sharedCpuProfileId = sharedCpuProfile;
       if (url != null && token != null) {
@@ -159,9 +161,6 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       }
       if (url2 != null && token2 != null) {
         await _connectSecond(persist: false);
-      }
-      if ((url == null || token == null) && (url2 == null || token2 == null)) {
-        setState(() => _tab = 2);
       }
     } catch (e) {
       if (mounted) setState(() => _error = '读取安全存储失败：$e');
@@ -190,9 +189,6 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
           draft.profileId = null;
           draft.poolId = null;
           draft.wallet.clear();
-          draft.powerLimit.clear();
-          draft.useGpuIntensity = false;
-          draft.gpuIntensity = 16;
         }
         for (final draft in _policyDrafts.values) {
           draft.dirty = false;
@@ -242,9 +238,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     if (api == null || !mounted) return;
     try {
       final status = await api.request('GET', '/api/v1/status');
-      final catalog = _catalog2 == null
-          ? await api.request('GET', '/api/v1/catalog')
-          : _catalog2;
+      final catalog = _catalog2 ?? await api.request('GET', '/api/v1/catalog');
       if (mounted) {
         setState(() {
           _status2 = status;
@@ -528,11 +522,6 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       draft.profileId = desired?['profile_id'] as String?;
       draft.poolId = desired?['pool_id'] as String?;
       _setTextIfChanged(draft.wallet, desired?['wallet'] as String? ?? '');
-      final power = desired?['power_limit_w'];
-      _setTextIfChanged(
-        draft.powerLimit,
-        power is num ? power.toInt().toString() : '',
-      );
     }
   }
 
@@ -557,6 +546,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       draft.throttleEnabled = policy['throttle_enabled'] == true;
       draft.nightModeEnabled = policy['night_mode_enabled'] == true;
       draft.externalTaskMonitor = policy['external_task_monitor'] == true;
+      draft.intensity = (policy['intensity'] as num?)?.toDouble() ?? 10;
       final memory = policy['min_free_memory_mib'];
       _setTextIfChanged(
         draft.minFreeMemory,
@@ -641,8 +631,9 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       if (mounted) {
         setState(() => _working = false);
         await _refreshSecond();
-        if (mounted && operationError != null)
+        if (mounted && operationError != null) {
           setState(() => _error = operationError);
+        }
       }
     }
   }
@@ -710,8 +701,6 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
 
   bool get _enabled =>
       _api != null && _status?['control_enabled'] == true && !_working;
-  List<JsonMap> get _profiles =>
-      ((_catalog?['profiles'] as List?) ?? []).cast<JsonMap>();
   List<JsonMap> get _cpuProfiles =>
       ((_catalog?['cpu_profiles'] as List?) ?? []).cast<JsonMap>();
 
@@ -753,8 +742,9 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     if (!_enabled2 ||
         _cpuDraft2.profileId == null ||
         _cpuDraft2.poolId == null ||
-        _cpuDraft2.wallet.text.trim().isEmpty)
+        _cpuDraft2.wallet.text.trim().isEmpty) {
       return;
+    }
     try {
       await _api2!.request('PUT', '/api/v1/cpu/selection', {
         'profile_id': _cpuDraft2.profileId,
@@ -809,14 +799,11 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         (_status?['gpu_controls'] as JsonMap?)?[gpuId.toString()] as JsonMap?;
     final selected = control?['desired'] as JsonMap?;
     final revision = _revisionFor(gpuId);
-    final draft = _gpuDrafts.putIfAbsent(gpuId, _GpuDraft.new);
     final profile = _profileFor(_catalog, selected?['profile_id'] as String?);
-    final intensity = draft.useGpuIntensity && profile?['miner'] == 'srb-pearl'
-        ? draft.gpuIntensity.round()
-        : null;
+    final intensity = profile?['miner'] == 'srb-pearl' ? 31 : null;
     final details = operation == 'stop'
         ? '停止 GPU Pocket 管理的 GPU$gpuId 矿工。'
-        : 'GPU$gpuId 将使用以下已暂存配置：\n算法：${selected?['profile_id']}\n矿池：${selected?['pool_id']}\n功耗上限：${selected?['power_limit_w'] ?? '系统默认'} W\nSRBMiner 强度：${intensity ?? '默认'}\n应用时可能中断当前计算。';
+        : 'GPU$gpuId 将使用以下已暂存配置：\n算法：${selected?['profile_id']}\n矿池：${selected?['pool_id']}\nSRBMiner 全量强度：${intensity ?? '不适用'}\n应用时可能中断当前计算。';
     if (await _confirm(
       operation == 'stop' ? '停止 GPU$gpuId' : '应用并重启 GPU$gpuId',
       details,
@@ -825,8 +812,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         await api.request('POST', '/api/v1/gpus/$gpuId/miner', {
           'operation': operation,
           'revision': revision,
-          if (operation != 'stop' && intensity != null)
-            'gpu_intensity': intensity,
+          if (operation != 'stop') 'mode': 'normal',
         });
       });
     }
@@ -844,6 +830,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     _token2.dispose();
     _sharedPoolId.dispose();
     _sharedWallet.dispose();
+    _aiTask.dispose();
     for (final draft in [..._gpuDrafts.values, ..._gpuDrafts2.values]) {
       draft.dispose();
     }
@@ -874,6 +861,11 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
           icon: const Icon(Icons.refresh),
           tooltip: '刷新',
         ),
+        IconButton(
+          onPressed: () => setState(() => _tab = _tab == 3 ? 0 : 3),
+          icon: Icon(_tab == 3 ? Icons.close : Icons.settings_outlined),
+          tooltip: _tab == 3 ? '关闭设置' : '设置',
+        ),
       ],
     ),
     body: RefreshIndicator(
@@ -888,23 +880,29 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
           ...switch (_tab) {
             0 => _overview(),
             1 => _controls(),
+            2 => _aiTasks(),
             _ => _settings(),
           },
         ],
       ),
     ),
-    bottomNavigationBar: NavigationBar(
-      selectedIndex: _tab,
-      onDestinationSelected: (i) {
-        setState(() => _tab = i);
-        if (i == 1) _refresh();
-      },
-      destinations: const [
-        NavigationDestination(icon: Icon(Icons.memory), label: '监控'),
-        NavigationDestination(icon: Icon(Icons.tune), label: '控制'),
-        NavigationDestination(icon: Icon(Icons.settings), label: '设置'),
-      ],
-    ),
+    bottomNavigationBar: _tab == 3
+        ? null
+        : NavigationBar(
+            selectedIndex: _tab,
+            onDestinationSelected: (i) {
+              setState(() => _tab = i);
+              if (i == 1) _refresh();
+            },
+            destinations: const [
+              NavigationDestination(icon: Icon(Icons.memory), label: '监控'),
+              NavigationDestination(icon: Icon(Icons.tune), label: '控制'),
+              NavigationDestination(
+                icon: Icon(Icons.smart_toy_outlined),
+                label: 'AI任务',
+              ),
+            ],
+          ),
   );
 
   Widget _notice(String text, Color color) => Container(
@@ -942,7 +940,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         _serverOverviewCard('2-titan', _status!, showErrors: true),
       if (_status == null && _api != null)
         _notice('2-titan 当前无法读取状态。', Colors.orangeAccent),
-      if (_status2 != null) _serverOverviewCard('zww', _status2!),
+      if (_status2 != null) _serverOverviewCard('zww', _status2!, second: true),
       if (_status2 == null && _api2 != null)
         _notice('zww 当前无法读取状态。', Colors.orangeAccent),
     ];
@@ -952,12 +950,11 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     String label,
     JsonMap status, {
     bool showErrors = false,
+    bool second = false,
   }) {
     final gpus = (status['gpus'] as List?)?.cast<JsonMap>() ?? [];
     final controls = status['gpu_controls'] as JsonMap? ?? {};
     final cpu = status['cpu_mining'] as JsonMap? ?? {};
-    final cpuService = cpu['service'] ?? 'unknown';
-    final cpuActive = cpu['active'] is Map ? cpu['active'] as JsonMap : null;
     return Card(
       margin: const EdgeInsets.only(bottom: 16),
       child: Padding(
@@ -970,37 +967,10 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
             if (showErrors)
               for (final error in (status['errors'] as List?) ?? [])
                 _notice(error.toString(), Colors.orangeAccent),
-            _cpuOverviewRow(cpu),
-            for (final gpu in gpus) _gpuCard(gpu, controls),
+            _cpuOverviewRow(cpu, second: second),
+            for (final gpu in gpus)
+              _gpuCard(gpu, controls, status, second: second),
             if (gpus.isEmpty) const Text('暂无 GPU 数据。请检查服务器 nvidia-smi。'),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _serverStatusCard(JsonMap status) {
-    final gpuList = (status['gpus'] as List?)?.cast<JsonMap>() ?? [];
-    final cpu = status['cpu_mining'] as JsonMap? ?? {};
-    return Card(
-      margin: const EdgeInsets.only(bottom: 16),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              status['host'] as String? ?? '第二台服务器',
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
-            const SizedBox(height: 8),
-            for (final gpu in gpuList)
-              Text(
-                'GPU ${gpu['index']} · ${gpu['utilization'] ?? '—'}% · ${gpu['temperature_c'] ?? '—'} °C · ${gpu['name']}',
-              ),
-            Text(
-              'CPU Miner · ${cpu['service'] ?? '未知'} · ${((cpu['active'] as JsonMap?)?['threads_percent'] ?? '—')}% threads',
-            ),
           ],
         ),
       ),
@@ -1030,59 +1000,100 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     return Colors.grey;
   }
 
-  Widget _cpuOverviewRow(JsonMap cpu) {
+  Widget _cpuOverviewRow(JsonMap cpu, {bool second = false}) {
     final service = cpu['service']?.toString() ?? 'unknown';
     final usage = cpu['usage_percent'];
     final active = cpu['active'] as JsonMap?;
     final selected =
         active?['threads_percent'] ?? cpu['desired']?['threads_percent'];
     final color = _cpuOverviewColor(cpu);
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      decoration: BoxDecoration(
-        color: color.withAlpha(35),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: color.withAlpha(150)),
-      ),
-      child: Row(
-        children: [
-          Icon(Icons.memory, size: 16, color: color),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              'CPU $service · 使用率 ${usage is num ? '${usage.round()}%' : '采样中'} · 可控 ${selected ?? '—'}%',
-              style: TextStyle(
-                color: color == Colors.grey ? Colors.white70 : color,
-              ),
+    return InkWell(
+      onTap: () => _quickCpuAction(second: second),
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: color.withAlpha(35),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: color.withAlpha(150)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.memory, size: 16, color: color),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'CPU $service · 使用率 ${usage is num ? '${usage.round()}%' : '采样中'} · 可控 ${selected ?? '—'}%',
+                    style: TextStyle(
+                      color: color == Colors.grey ? Colors.white70 : color,
+                    ),
+                  ),
+                ),
+                const Icon(Icons.tune, size: 18),
+              ],
             ),
-          ),
-        ],
+            if (service == 'failed' && cpu['service_error'] is String)
+              Padding(
+                padding: const EdgeInsets.only(left: 24, top: 5),
+                child: Text(
+                  '故障原因：${cpu['service_error']}',
+                  style: const TextStyle(color: Colors.redAccent, fontSize: 12),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _gpuCard(JsonMap gpu, JsonMap controls) {
+  Widget _gpuCard(
+    JsonMap gpu,
+    JsonMap controls,
+    JsonMap status, {
+    bool second = false,
+  }) {
     final utilization = gpu['utilization'] as num?;
     final gpuId = gpu['index'] as num?;
     final control = gpuId == null
         ? null
         : controls[gpuId.toInt().toString()] as JsonMap?;
+    final policyEntry = gpuId == null
+        ? null
+        : (status['policies'] as JsonMap?)?[gpuId.toInt().toString()]
+              as JsonMap?;
+    final policy = policyEntry?['policy'] as JsonMap?;
+    final automatic = policy?['enabled'] == true;
     final service = control?['service']?.toString();
+    final runningMode = policyEntry?['mode']?.toString();
+    final throttleActive =
+        service == 'active' &&
+        (runningMode == 'throttle' || runningMode == 'manual_throttle');
     final external = control?['external_pids'] as List?;
     final processes = control?['processes'] as List?;
     final hasExternal =
         (external?.isNotEmpty ?? false) || (processes?.isNotEmpty ?? false);
-    final color = service == 'active'
-        ? Colors.green
-        : hasExternal
-        ? Colors.amber
-        : (service == 'inactive' || service == null)
-        ? Colors.grey
-        : Colors.redAccent;
-    return Card(
-      margin: const EdgeInsets.only(bottom: 8),
-      color: color.withAlpha(18),
+    final color =
+        activeGpuModeColor(service, policyEntry?['mode']?.toString()) ??
+        (service == 'active'
+            ? Colors.green
+            : hasExternal
+            ? Colors.amber
+            : (service == 'inactive' || service == null)
+            ? Colors.grey
+            : Colors.redAccent);
+    final panelColor = Color.alphaBlend(
+      color.withAlpha(32),
+      Theme.of(context).scaffoldBackgroundColor,
+    );
+    final content = InkWell(
+      onTap: gpuId == null
+          ? null
+          : () => _quickGpuAction(gpuId.toInt(), second: second),
+      borderRadius: BorderRadius.circular(12),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         child: Column(
@@ -1101,12 +1112,24 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                 const SizedBox(width: 7),
                 Expanded(
                   child: Text(
-                    'GPU ${gpu['index']} · ${gpu['name'] ?? '未知设备'}',
+                    'GPU ${gpu['index']} · ${gpu['name'] ?? '未知设备'}${throttleActive ? ' · 节制运行中' : ''}',
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
+                if (automatic)
+                  const Tooltip(
+                    message: '自动模式已启用',
+                    child: Padding(
+                      padding: EdgeInsets.only(right: 6),
+                      child: Icon(
+                        Icons.autorenew,
+                        size: 17,
+                        color: Colors.cyanAccent,
+                      ),
+                    ),
+                  ),
                 Text(
-                  _number(utilization, '%'),
+                  'GPU占用 ${_number(utilization, '%')}',
                   style: Theme.of(
                     context,
                   ).textTheme.titleMedium?.copyWith(color: color),
@@ -1134,10 +1157,211 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
               '当前空闲 ${_idleDuration(control?['idle_seconds'])}',
               style: const TextStyle(color: Colors.white60, fontSize: 12),
             ),
+            if (service == 'failed' && control?['service_error'] is String)
+              Padding(
+                padding: const EdgeInsets.only(top: 5),
+                child: Text(
+                  '故障原因：${control!['service_error']}',
+                  style: const TextStyle(color: Colors.redAccent, fontSize: 12),
+                ),
+              ),
           ],
         ),
       ),
     );
+    if (!automatic) {
+      return Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        child: Material(
+          color: panelColor,
+          borderRadius: BorderRadius.circular(12),
+          clipBehavior: Clip.antiAlias,
+          child: content,
+        ),
+      );
+    }
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(1.5),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(14),
+        gradient: const SweepGradient(
+          colors: [
+            Colors.cyanAccent,
+            Colors.purpleAccent,
+            Colors.pinkAccent,
+            Colors.cyanAccent,
+          ],
+        ),
+      ),
+      child: Material(
+        color: panelColor,
+        borderRadius: BorderRadius.circular(12.5),
+        clipBehavior: Clip.antiAlias,
+        child: content,
+      ),
+    );
+  }
+
+  Future<void> _quickGpuAction(int gpuId, {required bool second}) async {
+    final status = second ? _status2 : _status;
+    final controls = status?['gpu_controls'] as JsonMap?;
+    final control = controls?[gpuId.toString()] as JsonMap?;
+    final desired = control?['desired'] as JsonMap?;
+    final enabled = second ? _enabled2 : _enabled;
+    if (!enabled) return;
+    if (desired == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('请先在控制页配置 GPU$gpuId 的算法、矿池和钱包。')));
+      return;
+    }
+    final mode = await showModalBottomSheet<String>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: Text('GPU$gpuId 快速控制'),
+              subtitle: Text(
+                '算法 ${desired['profile_id']} · 矿池 ${desired['pool_id']}',
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.rocket_launch),
+              title: const Text('全量启动'),
+              subtitle: const Text('SRBMiner 全量强度 31'),
+              onTap: () => Navigator.pop(context, 'normal'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.energy_savings_leaf),
+              title: const Text('节制启动（暂不可用）'),
+              subtitle: const Text('算法强度不限制 GPU 利用率，已暂停此启动方式'),
+              enabled: false,
+            ),
+            ListTile(
+              leading: const Icon(Icons.stop_circle_outlined),
+              title: const Text('停止'),
+              onTap: () => Navigator.pop(context, 'stop'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (mode == null) return;
+    final operation = mode == 'stop'
+        ? 'stop'
+        : control?['service'] == 'active'
+        ? 'restart'
+        : 'start';
+    final title = mode == 'stop' ? '停止 GPU$gpuId' : '启动 GPU$gpuId';
+    if (!await _confirm(
+      title,
+      mode == 'stop'
+          ? '停止 GPU Pocket 管理的 GPU$gpuId 矿工。'
+          : '全量模式，SRBMiner 强度 31\\n算法：${desired['profile_id']}\\n矿池：${desired['pool_id']}\\n钱包：${desired['wallet']}\\n${operation == 'restart' ? '当前矿工将重启。' : '将启动矿工。'}',
+    )) {
+      return;
+    }
+    final mutate = second ? _mutateSecond : _mutate;
+    await mutate((api) async {
+      await api.request('POST', '/api/v1/gpus/$gpuId/miner', {
+        'operation': operation,
+        'revision': desired['revision'],
+        'mode': mode == 'stop' ? 'normal' : mode,
+      });
+    });
+  }
+
+  Future<void> _quickCpuAction({required bool second}) async {
+    final status = second ? _status2 : _status;
+    final cpu = status?['cpu_mining'] as JsonMap?;
+    final desired = cpu?['desired'] as JsonMap?;
+    final enabled = second ? _enabled2 : _enabled;
+    if (!enabled) return;
+    if (desired == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请先在控制页配置 CPU 算法、矿池和钱包。')));
+      return;
+    }
+    var percent = (desired['threads_percent'] as num?)?.round() ?? 50;
+    final service = cpu?['service']?.toString();
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('CPU 快速控制'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('线程比例：$percent%'),
+              Slider(
+                value: percent.toDouble(),
+                min: 1,
+                max: 100,
+                divisions: 99,
+                label: '$percent%',
+                onChanged: (value) =>
+                    setDialogState(() => percent = value.round()),
+              ),
+              const Text(
+                '此比例是 SRBMiner 线程提示，不是严格的系统级 CPU 限额。',
+                style: TextStyle(color: Colors.white60),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            if (service == 'active')
+              TextButton(
+                onPressed: () => Navigator.pop(context, {'operation': 'stop'}),
+                child: const Text('停止'),
+              ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, {
+                'operation': service == 'active' ? 'restart' : 'start',
+                'percent': percent,
+              }),
+              child: Text(service == 'active' ? '应用并重启' : '启动'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (result == null) return;
+    final operation = result['operation'] as String;
+    if (!await _confirm(
+      operation == 'stop' ? '停止 CPU 矿工' : '应用 CPU 配置',
+      operation == 'stop'
+          ? '停止 GPU Pocket 管理的 CPU 矿工。'
+          : '线程比例：${result['percent']}%\\n算法：${desired['profile_id']}\\n矿池：${desired['pool_id']}',
+    )) {
+      return;
+    }
+    final mutate = second ? _mutateSecond : _mutate;
+    await mutate((api) async {
+      var revision = second ? _cpuRevision2 : _cpuRevision;
+      if (operation != 'stop' &&
+          result['percent'] != desired['threads_percent']) {
+        final saved = await api.request('PUT', '/api/v1/cpu/selection', {
+          'profile_id': desired['profile_id'],
+          'pool_id': desired['pool_id'],
+          'wallet': desired['wallet'],
+          'threads_percent': result['percent'],
+          'revision': revision,
+        });
+        revision = (saved['selection'] as JsonMap)['revision'] as int;
+      }
+      await api.request('POST', '/api/v1/cpu/miner', {
+        'operation': operation,
+        'revision': revision,
+      });
+    });
   }
 
   Widget _cpuCollapsedSummary(
@@ -1175,32 +1399,40 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     );
   }
 
-  Color _gpuStatusColor(JsonMap? control, JsonMap? metrics) {
+  Color _gpuStatusColor(JsonMap? control, JsonMap? metrics, String? mode) {
     final service = control?['service']?.toString();
-    if (service == 'active') return Colors.greenAccent;
+    final activeColor = activeGpuModeColor(service, mode);
+    if (activeColor != null) {
+      return mode == 'throttle' || mode == 'manual_throttle'
+          ? Colors.purpleAccent
+          : Colors.greenAccent;
+    }
     final external = control?['external_pids'] as List?;
     final processes = control?['processes'] as List?;
-    if ((external?.isNotEmpty ?? false) || (processes?.isNotEmpty ?? false))
+    if ((external?.isNotEmpty ?? false) || (processes?.isNotEmpty ?? false)) {
       return Colors.amber;
+    }
     return service == 'inactive' ? Colors.grey : Colors.blueGrey;
   }
 
-  Widget _gpuStatusDot(JsonMap? control, JsonMap? metrics) => Container(
-    width: 12,
-    height: 12,
-    decoration: BoxDecoration(
-      color: _gpuStatusColor(control, metrics),
-      shape: BoxShape.circle,
-    ),
-  );
+  Widget _gpuStatusDot(JsonMap? control, JsonMap? metrics, String? mode) =>
+      Container(
+        width: 12,
+        height: 12,
+        decoration: BoxDecoration(
+          color: _gpuStatusColor(control, metrics, mode),
+          shape: BoxShape.circle,
+        ),
+      );
 
   Future<void> _setCpuThreads1(int percent) async {
     final desired =
         (_status?['cpu_mining'] as JsonMap?)?['desired'] as JsonMap?;
     if (desired?['profile_id'] == null ||
         desired?['pool_id'] == null ||
-        desired?['wallet'] == null)
+        desired?['wallet'] == null) {
       return;
+    }
     setState(() {
       _cpuDraft.profileId = desired!['profile_id'] as String;
       _cpuDraft.poolId = desired['pool_id'] as String;
@@ -1216,8 +1448,9 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         (_status2?['cpu_mining'] as JsonMap?)?['desired'] as JsonMap?;
     if (desired?['profile_id'] == null ||
         desired?['pool_id'] == null ||
-        desired?['wallet'] == null)
+        desired?['wallet'] == null) {
       return;
+    }
     setState(() {
       _cpuDraft2.profileId = desired!['profile_id'] as String;
       _cpuDraft2.poolId = desired['pool_id'] as String;
@@ -1235,13 +1468,13 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         ExpansionTile(
           initiallyExpanded: true,
           leading: const Icon(Icons.memory),
-          title: const Text('2-titan'),
+          title: const Text('titan'),
           subtitle: Text(
             _status?['control_enabled'] == true ? '控制已启用' : '只读模式',
           ),
           children: [
             ExpansionTile(
-              title: const Text('CPU'),
+              title: const Text('titan · CPU'),
               subtitle: _cpuCollapsedSummary(
                 _status,
                 _enabled,
@@ -1262,7 +1495,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
           ),
           children: [
             ExpansionTile(
-              title: const Text('CPU'),
+              title: const Text('zww · CPU'),
               subtitle: _cpuCollapsedSummary(
                 _status2,
                 _enabled2,
@@ -1284,12 +1517,16 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
   Widget _firstGpuControlSection(int gpuId) {
     final controls = (_status?['gpu_controls'] as JsonMap?) ?? {};
     final metrics = ((_status?['gpus'] as List?) ?? []).cast<JsonMap>();
+    final mode =
+        ((_status?['policies'] as JsonMap?)?['$gpuId'] as JsonMap?)?['mode']
+            ?.toString();
     return ExpansionTile(
       leading: _gpuStatusDot(
         controls['$gpuId'] as JsonMap?,
         metrics.where((gpu) => gpu['index'] == gpuId).firstOrNull,
+        mode,
       ),
-      title: Text('GPU$gpuId'),
+      title: Text('titan · GPU$gpuId'),
       children: [
         _gpuControlCard(
           gpuId,
@@ -1306,24 +1543,21 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         (_status2?['gpu_controls'] as JsonMap?)?[gpuId.toString()] as JsonMap?;
     final desired = control?['desired'] as JsonMap?;
     final revision = desired?['revision'] as int? ?? 0;
-    final draft = _gpuDrafts2.putIfAbsent(gpuId, _GpuDraft.new);
     final profile = _profileFor(_catalog2, desired?['profile_id'] as String?);
-    final intensity = draft.useGpuIntensity && profile?['miner'] == 'srb-pearl'
-        ? draft.gpuIntensity.round()
-        : null;
+    final intensity = profile?['miner'] == 'srb-pearl' ? 31 : null;
     if (!await _confirm(
       operation == 'stop' ? '停止 zww GPU$gpuId' : '重启 zww GPU$gpuId',
       operation == 'stop'
           ? '停止 zww GPU$gpuId Miner。'
-          : '应用 GPU$gpuId 的已暂存配置并重启 Miner。\nSRBMiner 强度：${intensity ?? '默认'}',
-    ))
+          : '应用 zww GPU$gpuId 已暂存配置并重启 Miner。\nSRBMiner 全量强度：${intensity ?? '不适用'}',
+    )) {
       return;
+    }
     try {
       await _api2!.request('POST', '/api/v1/gpus/$gpuId/miner', {
         'operation': operation,
         'revision': revision,
-        if (operation != 'stop' && intensity != null)
-          'gpu_intensity': intensity,
+        if (operation != 'stop') 'mode': 'normal',
       });
       await _refreshSecond();
     } catch (e) {
@@ -1338,9 +1572,12 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         .cast<JsonMap>()
         .where((gpu) => gpu['index'] == gpuId)
         .firstOrNull;
+    final mode =
+        ((_status2?['policies'] as JsonMap?)?['$gpuId'] as JsonMap?)?['mode']
+            ?.toString();
     return ExpansionTile(
-      leading: _gpuStatusDot(control, gpuMetrics),
-      title: Text('GPU$gpuId'),
+      leading: _gpuStatusDot(control, gpuMetrics, mode),
+      title: Text('zww · GPU$gpuId'),
       subtitle: Text(gpuMetrics?['name'] as String? ?? '设备状态未知'),
       children: [_gpuControlCard(gpuId, control, gpuMetrics, second: true)],
     );
@@ -1366,7 +1603,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              '${_status2?['host'] ?? '第二台服务器'} CPU · $service',
+              'zww · CPU · $service',
               style: Theme.of(context).textTheme.titleLarge,
             ),
             const SizedBox(height: 14),
@@ -1439,7 +1676,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'CPU 挖矿 · $service',
+              'titan · CPU 挖矿 · $service',
               style: Theme.of(context).textTheme.titleLarge,
             ),
             const SizedBox(height: 8),
@@ -1578,37 +1815,37 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     final catalog = second ? _catalog2 : _catalog;
     final profileId = desired?['profile_id'] ?? draft.profileId;
     final profile = _profileFor(catalog, profileId as String?);
-    final supportsIntensity = profile?['miner'] == 'srb-pearl';
     final service = control?['service'] ?? 'unknown';
     final externalPids = control?['external_pids'] as List?;
     final processes = (control?['processes'] as List?)?.whereType<JsonMap>();
-    final statusColor = service == 'active'
-        ? Colors.green
-        : externalPids == null
-        ? Colors.orange
-        : externalPids.isNotEmpty
-        ? Colors.amber
-        : Colors.grey;
+    final runningMode = policyData?['mode']?.toString();
+    final throttleActive =
+        service == 'active' &&
+        (runningMode == 'throttle' || runningMode == 'manual_throttle');
+    final statusColor =
+        activeGpuModeColor(service.toString(), runningMode) ??
+        (service == 'active'
+            ? Colors.green
+            : externalPids == null
+            ? Colors.orange
+            : externalPids.isNotEmpty
+            ? Colors.amber
+            : Colors.grey);
     final statusLabel = service == 'active'
-        ? 'GPU Pocket 正在挖矿'
+        ? throttleActive
+              ? 'GPU Pocket 正在节制挖矿'
+              : 'GPU Pocket 正在全量挖矿'
         : externalPids == null
         ? '进程状态未知'
         : externalPids.isNotEmpty
         ? '其他进程正在使用 · PID ${externalPids.join(', ')}'
         : 'GPU 空闲';
-    final minPower = metrics?['power_min_limit_w'] as num?;
-    final maxPower = metrics?['power_max_limit_w'] as num?;
-    final powerRange = minPower != null && maxPower != null
-        ? '允许范围 ${minPower.ceil()}–${maxPower.floor()} W；留空使用算法默认值。'
-        : '服务器未提供此卡功耗范围，不能设置功耗上限。';
     final canStage =
         enabled &&
         draft.dirty &&
         draft.profileId != null &&
         draft.poolId != null &&
-        draft.wallet.text.trim().isNotEmpty &&
-        (draft.powerLimit.text.isEmpty ||
-            int.tryParse(draft.powerLimit.text) != null);
+        draft.wallet.text.trim().isNotEmpty;
 
     return Card(
       color: statusColor.withAlpha(32),
@@ -1619,7 +1856,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'GPU$gpuId · $service',
+              '${second ? 'zww' : 'titan'} · GPU$gpuId · $service',
               style: Theme.of(context).textTheme.titleLarge,
             ),
             const SizedBox(height: 8),
@@ -1642,7 +1879,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
             ),
             const SizedBox(height: 16),
             Text(
-              'GPU 进程（不显示 Xorg）',
+              'GPU 进程（已忽略 Xorg / Sunlogin / Chrome / Chromium / Cursor）',
               style: Theme.of(context).textTheme.titleSmall,
             ),
             const SizedBox(height: 4),
@@ -1653,51 +1890,12 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
             else
               for (final process in processes) _gpuProcessRow(process),
             const SizedBox(height: 12),
-            if (supportsIntensity) ...[
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('指定 SRBMiner 算法强度'),
-                subtitle: Text(
-                  draft.useGpuIntensity
-                      ? '启动/重启时使用所选强度。'
-                      : '关闭时使用 SRBMiner 默认强度。',
-                ),
-                value: draft.useGpuIntensity,
-                onChanged: enabled
-                    ? (value) => setState(() => draft.useGpuIntensity = value)
-                    : null,
-              ),
-              Text(
-                '算法强度：${draft.gpuIntensity.round()}（1–31）',
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
-              Slider(
-                min: 1,
-                max: 31,
-                divisions: 30,
-                value: draft.gpuIntensity.clamp(1, 31),
-                label: draft.gpuIntensity.round().toString(),
-                onChanged: enabled && draft.useGpuIntensity
-                    ? (value) => setState(() => draft.gpuIntensity = value)
-                    : null,
-              ),
-            ],
+            if (profile?['miner'] == 'srb-pearl')
+              const Text('全量启动固定使用 SRBMiner 强度 31；节制强度在下方自动控制中设置。'),
             const SizedBox(height: 12),
             const Text(
               '算法、矿池节点和钱包已统一在“设置”中管理。',
               style: TextStyle(color: Colors.white70),
-            ),
-            const SizedBox(height: 14),
-            TextField(
-              controller: draft.powerLimit,
-              enabled: enabled && minPower != null && maxPower != null,
-              keyboardType: TextInputType.number,
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              decoration: InputDecoration(
-                labelText: '功耗上限（W，可选）',
-                helperText: powerRange,
-              ),
-              onChanged: (_) => setState(() => draft.dirty = true),
             ),
             const SizedBox(height: 14),
             FilledButton.tonal(
@@ -1709,9 +1907,6 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                             'profile_id': draft.profileId,
                             'pool_id': draft.poolId,
                             'wallet': draft.wallet.text.trim(),
-                            'power_limit_w': draft.powerLimit.text.isEmpty
-                                ? null
-                                : int.parse(draft.powerLimit.text),
                             'revision': _revisionFor(gpuId, second: second),
                           });
                       draft.dirty = false;
@@ -1721,10 +1916,10 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
             ),
             const SizedBox(height: 10),
             Text(
-              '已暂存：${desired?['profile_id'] ?? '无'} / ${desired?['pool_id'] ?? '无'} · ${desired?['power_limit_w'] ?? '默认'} W · 版本 ${desired?['revision'] ?? 0}',
+              '已暂存：${desired?['profile_id'] ?? '无'} / ${desired?['pool_id'] ?? '无'} · 版本 ${desired?['revision'] ?? 0}',
             ),
             Text(
-              '运行记录：${active?['profile_id'] ?? '无'} / ${active?['pool_id'] ?? '无'} · ${active?['power_limit_w'] ?? '默认'} W · SRBMiner 强度 ${active?['gpu_intensity'] ?? '默认'} · 版本 ${active?['revision'] ?? 0}',
+              '运行记录：${active?['profile_id'] ?? '无'} / ${active?['pool_id'] ?? '无'} · SRBMiner 强度 ${active?['gpu_intensity'] ?? (profile?['miner'] == 'srb-pearl' ? 31 : '不适用')} · 版本 ${active?['revision'] ?? 0}',
             ),
             if (desired != null && desired['revision'] != active?['revision'])
               const Padding(
@@ -1760,7 +1955,9 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
               policyDraft,
               policy,
               runtime,
+              runningMode: runningMode,
               second: second,
+              throttleAvailable: profile?['miner'] == 'srb-pearl',
             ),
           ],
         ),
@@ -1806,21 +2003,25 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     _GpuPolicyDraft draft,
     JsonMap? policy,
     JsonMap? runtime, {
+    String? runningMode,
     bool second = false,
+    required bool throttleAvailable,
   }) {
     final enabled = second ? _enabled2 : _enabled;
     final canSave =
         enabled &&
         draft.dirty &&
-        int.tryParse(draft.minFreeMemory.text) != null;
+        int.tryParse(draft.minFreeMemory.text) != null &&
+        (!draft.throttleEnabled || throttleAvailable) &&
+        (!draft.nightModeEnabled || throttleAvailable);
     return [
       Text(
-        '自动控制 · 当前 ${policyDataMode(policy, runtime)}',
+        'GPU 模式 · 当前 ${policyDataMode(policy, runtime, runningMode)}',
         style: Theme.of(context).textTheme.titleMedium,
       ),
       const SizedBox(height: 6),
       const Text(
-        '自启模式会在 GPU 利用率低于 5% 持续 30 分钟后启动正常挖矿，不降低强度或功耗；深夜模式忽略功耗、计算占用和外部进程，只按可用显存阈值停矿。显存检查每 5 秒一次。',
+        '全量启动和自启使用 SRBMiner 强度 31。自启会在 GPU 利用率低于 5% 持续 30 分钟后启动。手动节制启动已暂停：算法强度不限制 GPU 利用率或功耗。深夜模式按可用显存阈值保护，显存检查每 5 秒一次。',
         style: TextStyle(color: Colors.white60),
       ),
       if (runtime?['message'] is String)
@@ -1842,8 +2043,11 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       SwitchListTile(
         contentPadding: EdgeInsets.zero,
         title: const Text('自启模式：低于 5% 持续 30 分钟后启动'),
+        subtitle: throttleAvailable
+            ? null
+            : const Text('需要选择 SRBMiner Pearl 算法'),
         value: draft.throttleEnabled,
-        onChanged: enabled
+        onChanged: enabled && throttleAvailable
             ? (value) => setState(() {
                 draft.throttleEnabled = value;
                 draft.dirty = true;
@@ -1853,8 +2057,11 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       SwitchListTile(
         contentPadding: EdgeInsets.zero,
         title: const Text('深夜模式：北京时间 01:00–08:00'),
+        subtitle: throttleAvailable
+            ? null
+            : const Text('需要选择 SRBMiner Pearl 算法'),
         value: draft.nightModeEnabled,
-        onChanged: enabled
+        onChanged: enabled && throttleAvailable
             ? (value) => setState(() {
                 draft.nightModeEnabled = value;
                 draft.dirty = true;
@@ -1894,6 +2101,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                   'night_mode_enabled': draft.nightModeEnabled,
                   'external_task_monitor': draft.externalTaskMonitor,
                   'min_free_memory_mib': int.parse(draft.minFreeMemory.text),
+                  'intensity': draft.intensity.round(),
                 });
                 draft.dirty = false;
               })
@@ -1903,7 +2111,12 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     ];
   }
 
-  String policyDataMode(JsonMap? policy, JsonMap? runtime) {
+  String policyDataMode(
+    JsonMap? policy,
+    JsonMap? runtime, [
+    String? runningMode,
+  ]) {
+    if (runningMode == 'manual_throttle') return '手动节制运行中';
     if (runtime?['memory_blocked'] == true) return '显存保护暂停';
     if (runtime?['external_task'] == true) return '外部任务保护';
     if (policy?['enabled'] != true) return '关闭';
@@ -1978,16 +2191,32 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       for (final draft in _gpuDrafts.values) {
         draft.profileId = _sharedGpuProfileId ?? draft.profileId;
         draft.poolId = pool;
-        _setTextIfChanged(draft.wallet, wallet);
+        _setTextIfChanged(
+          draft.wallet,
+          walletForDevice(wallet, draft.wallet.text, _sharedWalletPreset),
+        );
+        draft.dirty = true;
+      }
+      for (final draft in _gpuDrafts2.values) {
+        _setTextIfChanged(
+          draft.wallet,
+          walletForDevice(wallet, draft.wallet.text, _sharedWalletPreset),
+        );
         draft.dirty = true;
       }
       _cpuDraft.profileId = _sharedCpuProfileId ?? _cpuDraft.profileId;
       _cpuDraft.poolId = pool;
-      _setTextIfChanged(_cpuDraft.wallet, wallet);
+      _setTextIfChanged(
+        _cpuDraft.wallet,
+        walletForDevice(wallet, _cpuDraft.wallet.text, _sharedWalletPreset),
+      );
       _cpuDraft.dirty = true;
       _cpuDraft2.profileId = _sharedCpuProfileId ?? _cpuDraft2.profileId;
       _cpuDraft2.poolId = pool;
-      _setTextIfChanged(_cpuDraft2.wallet, wallet);
+      _setTextIfChanged(
+        _cpuDraft2.wallet,
+        walletForDevice(wallet, _cpuDraft2.wallet.text, _sharedWalletPreset),
+      );
       _cpuDraft2.dirty = true;
     });
     if (mounted) {
@@ -1996,6 +2225,67 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       ).showSnackBar(const SnackBar(content: Text('统一挖矿配置已保存到本机设置')));
     }
   }
+
+  List<Widget> _aiTasks() => [
+    _heading('AI任务', '向本机开发 AI 助手布置 GPU Pocket 项目任务。'),
+    Card(
+      color: const Color(0xFF20292E),
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                Icon(Icons.link_off, color: Colors.amber),
+                SizedBox(width: 10),
+                Text(
+                  '尚未连接本机 AI',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              '当前 App 和项目没有提供本机 Copilot / VS Code Agent 的任务桥接 API。为避免把任意命令执行服务暴露到公网，任务提交暂不可用。',
+              style: TextStyle(color: Colors.white70),
+            ),
+            const SizedBox(height: 16),
+            const Text('默认工作目录', style: TextStyle(color: Colors.white60)),
+            const SelectableText(
+              r'D:\work\github\gpu-pocket',
+              style: TextStyle(fontFamily: 'monospace'),
+            ),
+            const SizedBox(height: 20),
+            TextField(
+              controller: _aiTask,
+              minLines: 3,
+              maxLines: 6,
+              decoration: const InputDecoration(
+                labelText: '任务描述',
+                hintText: '描述希望本机 AI 在 GPU Pocket 中完成的工作',
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: null,
+                icon: const Icon(Icons.send),
+                label: const Text('连接本机 AI 后可提交'),
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextButton.icon(
+              onPressed: () => setState(() => _tab = 3),
+              icon: const Icon(Icons.settings_outlined),
+              label: const Text('打开设置'),
+            ),
+          ],
+        ),
+      ),
+    ),
+  ];
 
   List<Widget> _settings() => [
     _heading('设置', '统一管理挖矿配置、服务器连接与通知。'),
@@ -2082,54 +2372,36 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       }),
     ),
     const SizedBox(height: 12),
-    Builder(
-      builder: (context) {
-        final wallets = <String>{};
-        for (final status in [_status, _status2]) {
-          final cpu = status?['cpu_mining'] as JsonMap?;
-          for (final key in ['desired', 'active']) {
-            final selection = cpu?[key] as JsonMap?;
-            final wallet = selection?['wallet']?.toString();
-            if (wallet != null && wallet.isNotEmpty) wallets.add(wallet);
-          }
-          for (final control
-              in ((status?['gpu_controls'] as Map?) ?? {}).values) {
-            if (control is Map) {
-              for (final key in ['desired', 'active']) {
-                final selection = control[key];
-                if (selection is Map) {
-                  final wallet = selection['wallet']?.toString();
-                  if (wallet != null && wallet.isNotEmpty) wallets.add(wallet);
-                }
-              }
-            }
-          }
-        }
-        return DropdownButtonFormField<String>(
-          initialValue: wallets.contains(_sharedWallet.text)
-              ? _sharedWallet.text
-              : null,
-          isExpanded: true,
-          decoration: const InputDecoration(labelText: '可选钱包 / 账户'),
-          items: wallets
-              .map(
-                (wallet) =>
-                    DropdownMenuItem(value: wallet, child: Text(wallet)),
-              )
-              .toList(),
-          onChanged: (value) =>
-              setState(() => _setTextIfChanged(_sharedWallet, value ?? '')),
-        );
-      },
-    ),
-    const SizedBox(height: 12),
     TextField(
       controller: _sharedWallet,
       autocorrect: false,
       enableSuggestions: false,
-      decoration: const InputDecoration(
+      onChanged: (value) {
+        final preset = walletPresetFor(value);
+        if (_sharedWalletPreset != preset) {
+          setState(() => _sharedWalletPreset = preset);
+        }
+      },
+      decoration: InputDecoration(
         labelText: '钱包 / 账户.worker（公开，可直接显示）',
-        helperText: '不要填助记词或私钥。',
+        helperText: '可从右侧选择 Kryptex / NiceHash 账户；各设备 worker 后缀会保留。不要填助记词或私钥。',
+        suffixIcon: PopupMenuButton<String>(
+          tooltip: '选择预设账户',
+          icon: const Icon(Icons.account_balance_wallet_outlined),
+          onSelected: (account) {
+            setState(() {
+              _sharedWalletPreset = account;
+              _setTextIfChanged(
+                _sharedWallet,
+                walletWithPresetAccount(_sharedWallet.text, account),
+              );
+            });
+          },
+          itemBuilder: (context) => [
+            for (final entry in walletAccountPresets.entries)
+              PopupMenuItem(value: entry.value, child: Text(entry.key)),
+          ],
+        ),
       ),
     ),
     const SizedBox(height: 12),

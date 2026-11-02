@@ -277,14 +277,38 @@ async fn catalog_reports_public_miner_capabilities() {
     assert_eq!(catalog["profiles"][0]["miner"], "srb-pearl");
     assert_eq!(catalog["profiles"][1]["miner"], "lol-octopus");
     assert!(catalog["profiles"][0].get("binary").is_none());
+    for (profile, pool_ids) in [
+        (
+            &catalog["profiles"][0],
+            &["sg", "hk", "prl-eu", "prl-us"][..],
+        ),
+        (
+            &catalog["profiles"][1],
+            &[
+                "nicehash",
+                "octopus-usa",
+                "octopus-hk",
+                "octopus-br",
+                "octopus-in",
+                "octopus-jp",
+            ][..],
+        ),
+        (
+            &catalog["cpu_profiles"][0],
+            &["kryptex-us", "xmr-eu", "xmr-sg", "xmr-hk"][..],
+        ),
+    ] {
+        let pools = profile["pools"].as_array().unwrap();
+        for id in pool_ids {
+            assert!(pools.iter().any(|pool| pool["id"] == *id), "{id}");
+        }
+    }
 }
 
 #[tokio::test]
 async fn gpu_scoped_selections_and_services_are_independent() {
     let (app, _dir) = fixture();
-    for (gpu_id, profile_id, pool_id, power_limit_w) in
-        [(0, "pearl", "sg", 250), (1, "octopus", "nicehash", 300)]
-    {
+    for (gpu_id, profile_id, pool_id) in [(0, "pearl", "sg"), (1, "octopus", "nicehash")] {
         assert_eq!(
             call(
                 &app,
@@ -295,7 +319,7 @@ async fn gpu_scoped_selections_and_services_are_independent() {
                     "profile_id":profile_id,
                     "pool_id":pool_id,
                     "wallet":format!("wallet{gpu_id}.worker"),
-                    "power_limit_w":power_limit_w,
+                    "power_limit_w":401,
                     "revision":0
                 })
             )
@@ -318,12 +342,12 @@ async fn gpu_scoped_selections_and_services_are_independent() {
 
     let (_, status) = call(&app, "GET", "/api/v1/status", Value::Null).await;
     assert_eq!(status["gpu_controls"]["0"]["active"]["profile_id"], "pearl");
-    assert_eq!(status["gpu_controls"]["0"]["active"]["power_limit_w"], 250);
+    assert!(status["gpu_controls"]["0"]["active"]["power_limit_w"].is_null());
     assert_eq!(
         status["gpu_controls"]["1"]["active"]["profile_id"],
         "octopus"
     );
-    assert_eq!(status["gpu_controls"]["1"]["active"]["power_limit_w"], 300);
+    assert!(status["gpu_controls"]["1"]["active"]["power_limit_w"].is_null());
     assert_eq!(
         app.config
             .read_gpu_selection("applied", 0)
@@ -360,6 +384,7 @@ async fn policies_are_per_gpu_validated_and_disabled_by_default() {
     let (app, _dir) = fixture();
     let (_, status) = call(&app, "GET", "/api/v1/status", Value::Null).await;
     assert_eq!(status["policies"]["0"]["policy"]["enabled"], false);
+    assert_eq!(status["policies"]["0"]["policy"]["intensity"], 10);
     assert_eq!(
         status["policies"]["1"]["policy"]["min_free_memory_mib"],
         2048
@@ -378,6 +403,25 @@ async fn policies_are_per_gpu_validated_and_disabled_by_default() {
         }),
     )
     .await;
+    let (status, policy) = call(
+        &app,
+        "PUT",
+        "/api/v1/gpus/1/policy",
+        json!({
+            "gpu_id":1,
+            "enabled":true,
+            "throttle_enabled":true,
+            "night_mode_enabled":false,
+            "external_task_monitor":false,
+            "min_free_memory_mib":2048,
+            "power_limit_w":null,
+            "intensity":20
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(policy["policy"]["intensity"], 20);
+    assert!(policy["policy"]["power_limit_w"].is_null());
     assert_eq!(
         call(
             &app,
@@ -391,12 +435,26 @@ async fn policies_are_per_gpu_validated_and_disabled_by_default() {
                 "external_task_monitor":true,
                 "min_free_memory_mib":2048,
                 "power_limit_w":250,
+                "intensity":18
             })
         )
         .await
         .0,
         StatusCode::OK
     );
+    let (status, response) = call(
+        &app,
+        "POST",
+        "/api/v1/gpus/1/miner",
+        json!({"operation":"start","revision":1,"mode":"throttle"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE);
+    assert!(response["error"]
+        .as_str()
+        .unwrap()
+        .contains("does not cap GPU utilization"));
+    assert!(!app.demo_active.lock().await.contains_key(&1));
     assert_eq!(
         call(
             &app,
@@ -438,7 +496,7 @@ async fn policies_are_per_gpu_validated_and_disabled_by_default() {
 }
 
 #[tokio::test]
-async fn gpu_intensity_is_optional_and_bounded_on_startup() {
+async fn gpu_starts_use_mode_intensity_and_ignore_legacy_power_limits() {
     let (app, _dir) = fixture();
     assert_eq!(
         call(
@@ -456,25 +514,12 @@ async fn gpu_intensity_is_optional_and_bounded_on_startup() {
         .0,
         StatusCode::OK
     );
-    for intensity in [0, 32] {
-        assert_eq!(
-            call(
-                &app,
-                "POST",
-                "/api/v1/miner",
-                json!({"operation":"restart","revision":1,"gpu_intensity":intensity})
-            )
-            .await
-            .0,
-            StatusCode::BAD_REQUEST
-        );
-    }
     assert_eq!(
         call(
             &app,
             "POST",
             "/api/v1/miner",
-            json!({"operation":"restart","revision":1,"gpu_intensity":1})
+            json!({"operation":"restart","revision":1,"mode":"normal"})
         )
         .await
         .0,
@@ -485,7 +530,7 @@ async fn gpu_intensity_is_optional_and_bounded_on_startup() {
             .read_gpu_selection("applied", 0)
             .unwrap()
             .gpu_intensity,
-        Some(1)
+        None
     );
     assert_eq!(
         call(
@@ -507,19 +552,107 @@ async fn gpu_intensity_is_optional_and_bounded_on_startup() {
     );
 }
 
-#[test]
-fn legacy_throttle_mode_migrates_to_normal() {
+#[tokio::test]
+async fn manual_throttle_start_is_disabled_without_changing_gpu_mode() {
     let (app, _dir) = fixture();
-    std::fs::write(
-        app.config.state_dir.join("gpu0-mode.json"),
-        "\"throttle\"",
+    assert_eq!(
+        call(
+            &app,
+            "PUT",
+            "/api/v1/gpus/0/selection",
+            json!({
+                "gpu_id":0,
+                "profile_id":"pearl",
+                "pool_id":"sg",
+                "wallet":"testWallet.worker",
+                "revision":0
+            })
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/gpus/0/miner",
+        json!({"operation":"start","revision":1,"mode":"throttle"}),
     )
-    .unwrap();
+    .await;
+
+    assert_eq!(status, StatusCode::GONE);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("does not cap GPU utilization"));
     assert_eq!(app.config.read_gpu_mode(0).unwrap(), GpuMode::Normal);
+    assert!(!app.demo_active.lock().await.contains_key(&0));
+}
+
+#[test]
+fn only_manual_throttle_mode_can_share_with_unmanaged_gpu_tasks() {
+    assert!(!requires_exclusive_gpu(GpuMode::Throttle, true));
+    assert!(requires_exclusive_gpu(GpuMode::Normal, true));
+    assert!(requires_exclusive_gpu(GpuMode::Throttle, false));
+    assert!(requires_exclusive_gpu(GpuMode::Night, false));
+}
+
+#[test]
+fn manual_throttle_is_persisted_separately_and_survives_automation_disable() {
+    assert_eq!(
+        mode_for_action(
+            Operation::Start,
+            "inactive",
+            GpuMode::Throttle,
+            GpuMode::Normal,
+            true,
+        ),
+        GpuMode::ManualThrottle
+    );
+    assert_eq!(
+        mode_for_action(
+            Operation::Restart,
+            "active",
+            GpuMode::Normal,
+            GpuMode::Throttle,
+            false,
+        ),
+        GpuMode::Normal
+    );
+    assert!(!is_automatic_mode(GpuMode::ManualThrottle));
+    assert!(is_automatic_mode(GpuMode::Throttle));
+    assert!(!should_stop_for_external_task(
+        GpuMode::ManualThrottle,
+        true
+    ));
+    assert!(should_stop_for_external_task(GpuMode::Throttle, false));
+    assert!(should_stop_for_external_task(GpuMode::Normal, true));
+    assert!(should_auto_start(true, 30 * 60, false));
+    assert!(!should_auto_start(true, 30 * 60, true));
+    assert!(!should_auto_start(false, 30 * 60, false));
+    assert!(!should_auto_start(true, 30 * 60 - 1, false));
+    assert_eq!(srbminer_intensity(GpuMode::ManualThrottle, 10).unwrap(), 10);
+}
+
+#[test]
+fn throttle_mode_is_preserved() {
+    let (app, _dir) = fixture();
+    assert_eq!(app.config.read_gpu_policy(0).unwrap().intensity, 10);
+    std::fs::write(app.config.state_dir.join("gpu0-mode.json"), "\"throttle\"").unwrap();
+    assert_eq!(app.config.read_gpu_mode(0).unwrap(), GpuMode::Throttle);
     assert_eq!(
         std::fs::read_to_string(app.config.state_dir.join("gpu0-mode.json")).unwrap(),
-        "\"normal\""
+        "\"throttle\""
     );
+}
+
+#[test]
+fn full_and_throttle_modes_select_expected_srbminer_intensity() {
+    assert_eq!(srbminer_intensity(GpuMode::Normal, 10).unwrap(), 31);
+    assert_eq!(srbminer_intensity(GpuMode::Throttle, 10).unwrap(), 10);
+    assert_eq!(srbminer_intensity(GpuMode::Throttle, 27).unwrap(), 27);
+    assert!(srbminer_intensity(GpuMode::Throttle, 32).is_err());
 }
 
 #[test]
@@ -599,24 +732,6 @@ async fn rejects_wallet_injection_wrong_pool_and_disabled_control() {
                 "PUT",
                 "/api/v1/selection",
                 json!({"profile_id":"pearl","pool_id":"sg","wallet":wallet,"revision":0})
-            )
-            .await
-            .0,
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            call(
-                &app,
-                "PUT",
-                "/api/v1/gpus/1/selection",
-                json!({
-                    "gpu_id":1,
-                    "profile_id":"pearl",
-                    "pool_id":"sg",
-                    "wallet":"valid.worker",
-                    "power_limit_w":401,
-                    "revision":0
-                })
             )
             .await
             .0,

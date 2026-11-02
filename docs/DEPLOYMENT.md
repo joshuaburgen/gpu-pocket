@@ -63,7 +63,9 @@ sudo systemctl restart gpu-pocket-api.service
 
 若服务器直连 Google 不通，可在 API 服务环境中单独设置 `GPU_POCKET_FCM_PROXY`（例如 `http://127.0.0.1:7890`）。此代理只用于 OAuth/FCM 出站请求，不影响手机访问 API 的连接；先验证代理能建立到 `oauth2.googleapis.com` 和 `fcm.googleapis.com` 的 HTTPS 连接，再重启服务并实际验收通知。
 
-服务端进程监视器每 5 秒采样 GPU 进程并排除 Xorg。可执行文件路径不在配置的 `gpu_root` 下或无法确认时，会对新出现的进程发送推送；相同进程持续运行不会重复通知，退出后再出现会再次通知。服务启动后的首次采样作为基线，不会把启动前已有的进程当成新进程告警。
+服务端进程监视器每 5 秒采样 GPU 进程并排除 Xorg、Sunlogin、Chrome/Chromium 和 Cursor。其余 GPU 进程仍按是否位于 `gpu_root` 外识别，不因进程所有者而过滤；不属于对应 GPU Pocket 服务的 compute 进程也会阻止接管。新出现的目录外进程会发送推送；相同进程持续运行不会重复通知，退出后再出现会再次通知。服务启动后的首次采样作为基线，不会把启动前已有的进程当成新进程告警。
+
+手机设置页的矿池候选来自服务端配置的白名单，而不是客户端硬编码。新增或调整节点时，更新 `/etc/gpu-pocket/server.toml` 中对应的 profile/pool 条目并重启 API；`server/config.example.toml` 提供 Kryptex PRL/XMR 与 NiceHash OCTOPUS 的区域节点样例。服务端仍会拒绝未配置的节点。
 
 ## 2. HTTPS 入口
 
@@ -98,8 +100,8 @@ sudo systemctl daemon-reload
 1. 每次只迁移一张卡。用原会话的 Ctrl+C 或原有管理方式停止该卡对应的监督器和子矿工；不要使用 `pkill`、`killall` 或按软件名批量停止。
 2. 用 `nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv` 核实目标 GPU 已释放。API 检测到不属于对应 `gpu-pocket-miner@<id>.service` cgroup 的进程会返回 409，不会自动杀进程；不要停止另一张卡上的工作。
 3. 管理员将 `/etc/gpu-pocket/server.toml` 的 `control_enabled` 改为 true，并重启 `gpu-pocket-api.service`。
-4. 手机在目标 GPU 卡片上选择算法、矿池、可选功耗上限及自己核实过的钱包，暂存后确认应用。
-5. 检查对应实例，例如 `systemctl status gpu-pocket-miner@0.service` 和 `journalctl -u gpu-pocket-miner@0.service`；核实 GPU 分配、钱包、目标矿池及实际接受份额。逐卡功耗参数未经真实矿工环境验证，首次启动应现场观察功耗，确认后再迁移另一张卡。
+4. 手机在目标 GPU 卡片上选择算法、矿池及自己核实过的钱包，暂存后确认应用。SRBMiner 全量强度固定为 31；节制强度在控制页配置，默认 10。不设置功耗上限。
+5. 检查对应实例，例如 `systemctl status gpu-pocket-miner@0.service` 和 `journalctl -u gpu-pocket-miner@0.service`；核实 GPU 分配、钱包、目标矿池、矿工强度及实际接受份额。首次启动应现场观察 GPU 状态，确认后再迁移另一张卡。
 
 新服务先进入现有 `research-tun`，再以 `joshua` 执行固定矿工参数。GPU0、GPU1 与 CPU 各自使用独立 systemd 服务与状态文件。它不修改代理订阅、DNS、GPU 驱动或固件。新增矿池由管理员编辑 TOML。
 
@@ -127,7 +129,7 @@ GPU0 与 GPU1 使用分开的 sudoers 规则。仅在准备接管相应 GPU 时�
 sudo bash /path/to/staging/enable-control-gpu0.sh /path/to/staging
 ```
 
-该脚本备份 API 配置和二进制，安装矿工 unit 与仅限 GPU0 的 sudoers 规则，启用 API 控制并重启用户级 API；**不会停止现有进程、启动矿工或启用矿工开机启动**。它为 API 用户服务添加 `NoNewPrivileges=no` 覆盖，因为 `NoNewPrivileges=true` 会阻止 `sudo` 的 setuid 提权。为限制风险，sudoers 只允许 API 用户操作明确列出的 GPU miner systemd 单元；不要扩大该命令白名单。GPU0 旧矿工仍在运行时，App 的启动会因外部 GPU 进程而返回冲突；先在原监督器会话中停止目标 GPU0，再从 App 启动。不要将管理员密码或令牌粘贴到聊天中。
+该脚本备份 API 配置和二进制，安装矿工 unit 与仅限 GPU0 的 sudoers 规则，启用 API 控制并重启用户级 API；**不会停止现有进程、启动矿工或启用矿工开机启动**。它为 API 用户服务添加 `NoNewPrivileges=no` 覆盖，因为 `NoNewPrivileges=true` 会阻止 `sudo` 的 setuid 提权。为限制风险，sudoers 只允许 API 用户操作明确列出的 GPU miner systemd 单元；不要扩大该命令白名单。App 手动节制启动允许与其他 GPU 计算任务共存；全量启动仍要求先停止目标 GPU 的外部任务。节制强度不是显存或功耗硬上限，共用时仍可能资源不足或性能下降。不要将管理员密码或令牌粘贴到聊天中。
 
 若要独立启用 GPU1 的 systemd 控制，将 `deploy/gpu-pocket-gpu1.sudoers` 放入服务器暂存目录，并在可信终端执行：
 

@@ -68,7 +68,16 @@ class GpuApi {
     try {
       data = jsonDecode(utf8.decode(chunks)) as JsonMap;
     } on FormatException {
-      throw ApiException('服务器未返回 JSON。请检查 Cloudflare Access 是否拦截了 API。');
+      final body = utf8
+          .decode(chunks, allowMalformed: true)
+          .replaceAll(RegExp(r'\s+'), ' ')
+          .trim();
+      final preview = body.length > 180 ? '${body.substring(0, 180)}…' : body;
+      final contentType = response.headers.contentType?.mimeType ?? '未知';
+      throw ApiException(
+        '服务器返回了非 JSON 响应（HTTP ${response.statusCode}，$contentType）'
+        '${preview.isEmpty ? '。' : '：$preview'}',
+      );
     } on TypeError {
       throw ApiException('服务器响应格式不正确。');
     }

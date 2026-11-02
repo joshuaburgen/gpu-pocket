@@ -5,6 +5,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('server/Cargo.lock') }}
       - run: rustup update stable --profile minimal --component rustfmt,clippy
       - run: cargo +stable fmt --manifest-path server/Cargo.toml --check
       - run: cargo +stable test --manifest-path server/Cargo.toml --locked
@@ -13,8 +20,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+      - uses: actions/cache@v4
+        id: flutter-sdk
+        with:
+          path: ${{ runner.temp }}/flutter
+          key: flutter-${{ runner.os }}-3.47.9
+      - run: git clone --depth 1 --branch 3.47.9 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+        if: steps.flutter-sdk.outputs.cache-hit != 'true'
       - run: echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('mobile/pubspec.lock') }}
       - run: flutter pub get
         working-directory: mobile
       - run: dart format --output=none --set-exit-if-changed lib test

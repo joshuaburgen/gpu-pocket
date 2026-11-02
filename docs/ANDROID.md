@@ -4,7 +4,9 @@
 
 ## 开发环境
 
-本地 Flutter SDK 位于 `.tools/flutter`，Android SDK 位于 `.tools/android-sdk`，Gradle 缓存位于 `.tools/gradle`。这些目录均被 Git 忽略。使用 JDK 17 或更新版本；本机现有 PyCharm 的 `jbr` 可以复用，无需修改系统默认 Java。
+构建脚本优先使用 `FLUTTER_ROOT`、`ANDROID_HOME` 和 `JAVA_HOME`，也可以通过 `-FlutterRoot`、`-AndroidHome` 和 `-JavaHome` 显式指定路径。未配置时分别回退到 `.tools/flutter`、`.tools/android-sdk` 和 `.tools/jdk-17`。Gradle 缓存仍位于 `.tools/gradle`，这些目录均被 Git 忽略。使用 JDK 17 或更新版本。
+
+本机共用工具现位于 `E:\Apps\Flutter`、`E:\Apps\Android\SDK` 和 `E:\Apps\Java\jdk-17`；原 `.tools` 下对应的三个目录通过 NTFS 目录联接保持兼容。迁移后需要重启终端或 IDE，才能读取新的用户环境变量。
 
 Android 工程当前使用 Android SDK 36、Build Tools 36.0.0、NDK 28.2.13676358 和 Gradle 9.3.1。Gradle Wrapper 验证官方 SHA256。SDK 工具安装后，可以运行：
 

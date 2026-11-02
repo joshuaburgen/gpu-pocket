@@ -12,7 +12,9 @@ https://federation-privileges-honey-submitting.trycloudflare.com
 
 API 令牌位于开发机项目的 `.local/connection.json` 的 `token` 字段。该文件已被 Git 忽略，不应提交或公开。远端原始凭据在 `/media/new_data3/.config/gpu-pocket/api.env`，权限为 0600。App 连接页分别填写 URL 和令牌；不要将整个 JSON 粘贴进令牌输入框。
 
-当前 API 的 `control_enabled` 为 false，公网可监控两张 GPU。矿工启停、算法／钱包切换和代理节点写入均被拒绝，原有工作未接管。Android APK 尚待安装 Android SDK / JDK 后构建。
+截至 2026-11-02，API 的 `control_enabled` 为 true；持有 API 令牌的 App 可执行已授权的矿工控制操作。Titan GPU0 为 active，GPU1 有独立外部进程，未被 GPU Pocket 接管。Quick Tunnel 是公网入口，所有 API 请求仍须携带令牌；不要公开令牌或将其写入 APK。Android release APK 已安装并启动，覆盖安装保留原有 App 数据。
+
+手机访问 Titan API 不需要加入 Tailscale：APK 默认地址与上方 Quick Tunnel 地址相同。该隧道运行在 Titan 上，只把公网 HTTPS 请求转发至 Titan 的 `127.0.0.1:8787`，并不会把当前 Windows 电脑接入 Cloudflare，也不会建立 Windows 远程操作通道。若以后要通过手机让 AI 操作 Windows，应先在 Windows 上实现只允许明确、有限操作的授权服务，再将该服务作为隧道目标；不要把 PowerShell、SSH 或任意命令执行端点直接暴露到公网。
 
 地址在 Quick Tunnel 进程重启后可能变化。不要因 App 连接失败而直接重启隧道；先检查当前地址。API 服务重启通常不改变隧道地址。
 

@@ -94,7 +94,9 @@ pub async fn collect() -> Result<Vec<Gpu>> {
 pub async fn ensure_gpu_owned(gpu_id: u32) -> Result<()> {
     let unmanaged = unmanaged_compute_pids(gpu_id).await?;
     if let Some(pid) = unmanaged.first() {
-        bail!("GPU{gpu_id} is occupied by unmanaged PID {pid}; stop the old supervisor manually before takeover");
+        bail!(
+            "GPU{gpu_id} has unmanaged PID {pid}; full-intensity takeover requires stopping the old task first"
+        );
     }
     Ok(())
 }
@@ -105,27 +107,22 @@ pub async fn unmanaged_compute_pids(gpu_id: u32) -> Result<Vec<u32>> {
         .iter()
         .find(|g| g.index == gpu_id)
         .with_context(|| format!("GPU{gpu_id} not found"))?;
-    let processes = output(
-        "nvidia-smi",
-        &[
-            "--query-compute-apps=gpu_uuid,pid",
-            "--format=csv,noheader,nounits",
-        ],
-    )
-    .await?;
+    let processes = parse_compute_processes(
+        &output(
+            "nvidia-smi",
+            &[
+                "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+        )
+        .await?,
+    )?;
     let expected_service = format!("gpu-pocket-miner@{gpu_id}.service");
     let mut unmanaged = Vec::new();
-    for line in processes.lines() {
-        if line.trim().is_empty() || line.contains("No running processes") {
+    for ((uuid, pid), process) in processes {
+        if uuid != gpu.uuid || is_ignored_gpu_process(&process.name) {
             continue;
         }
-        let Some((uuid, pid)) = line.split_once(',') else {
-            bail!("unrecognized GPU process row");
-        };
-        if uuid.trim() != gpu.uuid {
-            continue;
-        }
-        let pid: u32 = pid.trim().parse().context("invalid process id")?;
         let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).with_context(|| {
             format!("cannot verify GPU{gpu_id} process ownership; retry after process exits")
         })?;
@@ -177,6 +174,9 @@ pub async fn processes(gpu_root: &Path) -> Result<Vec<GpuProcess>> {
                 .and_then(|name| name.to_str())
                 .unwrap_or(&compute.name)
                 .to_string();
+            if is_ignored_gpu_process(&process.name) {
+                continue;
+            }
             process.memory_used_mib = compute.memory_used_mib;
             process.within_gpu_root = Some(executable.starts_with(&gpu_root));
             process.executable = Some(compute.name.clone());
@@ -188,10 +188,20 @@ pub async fn processes(gpu_root: &Path) -> Result<Vec<GpuProcess>> {
             Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
-                available.push(process);
+                if !is_ignored_gpu_process(&process.name) {
+                    available.push(process);
+                }
                 continue;
             }
         };
+        if is_ignored_gpu_process(
+            executable
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(""),
+        ) {
+            continue;
+        }
         process.within_gpu_root = Some(executable.starts_with(&gpu_root));
         process.executable = Some(executable.to_string_lossy().into_owned());
         available.push(process);
@@ -290,6 +300,17 @@ fn is_xorg(name: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("xorg"))
 }
 
+fn is_ignored_gpu_process(name: &str) -> bool {
+    let name = Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    ["sunlogin", "chrome", "chromium", "google-chrome", "cursor"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
 pub fn demo() -> Vec<Gpu> {
     parse("0, GPU-demo-0, NVIDIA GeForce RTX 3080 Ti (DEMO), 92, 540, 12288, 65, 280, 350, 100, 400, 70, P2\n1, GPU-demo-1, NVIDIA GeForce RTX 3080 Ti (DEMO), 80, 5492, 12288, 68, 145, 350, 100, 400, N/A, P2").unwrap()
 }
@@ -325,5 +346,20 @@ Processes:
         let process = processes.get(&(gpus[&1].clone(), 345678)).unwrap();
         assert_eq!(process.name, "/media/Tongji-Wang/gpu/miner");
         assert_eq!(process.memory_used_mib, Some(1024.0));
+    }
+
+    #[test]
+    fn ignores_requested_background_applications_only() {
+        for name in [
+            "/usr/bin/SunloginClient",
+            "/usr/bin/google-chrome-stable",
+            "/usr/lib/chromium/chromium",
+            "/opt/Cursor/cursor",
+        ] {
+            assert!(is_ignored_gpu_process(name), "{name}");
+        }
+        for name in ["/usr/bin/python3", "/opt/miner/custom-worker"] {
+            assert!(!is_ignored_gpu_process(name), "{name}");
+        }
     }
 }

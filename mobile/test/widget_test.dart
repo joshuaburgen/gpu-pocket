@@ -5,6 +5,16 @@ import 'package:gpu_pocket/main.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  test('active throttle mode uses purple while full mode stays green', () {
+    expect(activeGpuModeColor('active', 'throttle'), Colors.purpleAccent);
+    expect(
+      activeGpuModeColor('active', 'manual_throttle'),
+      Colors.purpleAccent,
+    );
+    expect(activeGpuModeColor('active', 'normal'), Colors.green);
+    expect(activeGpuModeColor('inactive', 'throttle'), isNull);
+  });
+
   setUp(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
@@ -12,27 +22,38 @@ void main() {
           (call) async => null,
         );
   });
-  testWidgets('first launch shows connection form and rejects public HTTP', (
+  testWidgets('settings offers wallet presets in the worker field', (
     tester,
   ) async {
     await tester.pumpWidget(const GpuPocketApp());
     await tester.pumpAndSettle();
-    expect(find.text('连接服务器'), findsOneWidget);
+    await tester.tap(find.byTooltip('设置'));
+    await tester.pumpAndSettle();
+    expect(find.text('统一挖矿配置'), findsOneWidget);
+    expect(find.text('可选钱包 / 账户'), findsNothing);
+    await tester.tap(find.byIcon(Icons.account_balance_wallet_outlined));
+    await tester.pumpAndSettle();
+    expect(find.text('Kryptex'), findsOneWidget);
+    expect(find.text('NiceHash'), findsOneWidget);
+    await tester.tap(find.text('Kryptex'));
+    await tester.pumpAndSettle();
     expect(
       tester.widget<TextField>(find.byType(TextField).first).controller!.text,
-      const String.fromEnvironment('GPU_POCKET_DEFAULT_URL'),
+      'krxXPVDK8N',
     );
-    await tester.enterText(
-      find.byType(TextField).at(0),
-      'http://gpu.example.com',
-    );
-    await tester.enterText(
-      find.byType(TextField).at(1),
-      'test-only-token-with-at-least-32-characters',
-    );
-    await tester.tap(find.text('保存并连接'));
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('AI task tab shows the GPU Pocket working directory', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const GpuPocketApp());
     await tester.pumpAndSettle();
-    expect(find.textContaining('请输入 HTTPS 地址'), findsOneWidget);
+    await tester.tap(find.text('AI任务').last);
+    await tester.pumpAndSettle();
+    expect(find.text('尚未连接本机 AI'), findsOneWidget);
+    expect(find.text(r'D:\work\github\gpu-pocket'), findsOneWidget);
+    expect(find.text('连接本机 AI 后可提交'), findsOneWidget);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 }

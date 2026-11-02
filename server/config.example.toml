@@ -23,6 +23,18 @@ label = "Kryptex Hong Kong"
 address = "prl-hk.kryptex.network:7048"
 tls = false
 
+[[profiles.pools]]
+id = "prl-eu"
+label = "Kryptex Europe"
+address = "prl-eu.kryptex.network:7048"
+tls = false
+
+[[profiles.pools]]
+id = "prl-us"
+label = "Kryptex USA"
+address = "prl-us.kryptex.network:7048"
+tls = false
+
 [[cpu_profiles]]
 id = "xmr-randomx"
 label = "Monero (XMR) · RandomX / SRBMiner CPU"
@@ -35,6 +47,24 @@ label = "Kryptex US"
 address = "xmr-us.kryptex.network:7029"
 tls = false
 
+[[cpu_profiles.pools]]
+id = "xmr-eu"
+label = "Kryptex Europe · XMR"
+address = "xmr-eu.kryptex.network:7029"
+tls = false
+
+[[cpu_profiles.pools]]
+id = "xmr-sg"
+label = "Kryptex Singapore · XMR"
+address = "xmr-sg.kryptex.network:7029"
+tls = false
+
+[[cpu_profiles.pools]]
+id = "xmr-hk"
+label = "Kryptex Hong Kong · XMR"
+address = "xmr-hk.kryptex.network:7029"
+tls = false
+
 [[profiles]]
 id = "octopus"
 label = "NiceHash · OCTOPUS / lolMiner"
@@ -45,6 +75,36 @@ binary = "research-octopus-1.98a/research-octopus"
 id = "nicehash"
 label = "NiceHash Europe"
 address = "octopus.eu.nicehash.com:3389"
+tls = false
+
+[[profiles.pools]]
+id = "octopus-usa"
+label = "NiceHash USA"
+address = "octopus.usa.nicehash.com:3389"
+tls = false
+
+[[profiles.pools]]
+id = "octopus-hk"
+label = "NiceHash Hong Kong"
+address = "octopus.hk.nicehash.com:3389"
+tls = false
+
+[[profiles.pools]]
+id = "octopus-br"
+label = "NiceHash Brazil"
+address = "octopus.br.nicehash.com:3389"
+tls = false
+
+[[profiles.pools]]
+id = "octopus-in"
+label = "NiceHash India"
+address = "octopus.in.nicehash.com:3389"
+tls = false
+
+[[profiles.pools]]
+id = "octopus-jp"
+label = "NiceHash Japan"
+address = "octopus.jp.nicehash.com:3389"
 tls = false
 
 [proxy]

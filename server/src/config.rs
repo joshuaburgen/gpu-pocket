@@ -58,9 +58,9 @@ pub struct Selection {
     pub profile_id: String,
     pub pool_id: String,
     pub wallet: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub power_limit_w: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub gpu_intensity: Option<u32>,
     pub revision: u64,
 }
@@ -90,9 +90,9 @@ pub struct GpuPolicy {
     pub external_task_monitor: bool,
     #[serde(default = "default_memory_floor")]
     pub min_free_memory_mib: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub power_limit_w: Option<u32>,
-    #[serde(default = "default_intensity")]
+    #[serde(default = "default_throttle_intensity")]
     pub intensity: u32,
 }
 
@@ -102,6 +102,7 @@ pub enum GpuMode {
     #[default]
     Normal,
     Throttle,
+    ManualThrottle,
     Night,
 }
 
@@ -113,8 +114,8 @@ fn default_memory_floor() -> u32 {
     2048
 }
 
-fn default_intensity() -> u32 {
-    20
+fn default_throttle_intensity() -> u32 {
+    10
 }
 
 fn default_cpu_threads_percent() -> u32 {
@@ -131,7 +132,7 @@ impl GpuPolicy {
             external_task_monitor: false,
             min_free_memory_mib: default_memory_floor(),
             power_limit_w: None,
-            intensity: default_intensity(),
+            intensity: default_throttle_intensity(),
         }
     }
 }
@@ -221,11 +222,6 @@ impl Config {
         if s.gpu_id > 1 {
             bail!("gpu_id must be 0 or 1");
         }
-        if s.power_limit_w
-            .is_some_and(|power| !(10..=1000).contains(&power))
-        {
-            bail!("power_limit_w must be between 10 and 1000");
-        }
         if s.wallet.is_empty()
             || s.wallet.len() > 256
             || s.wallet.starts_with('-')
@@ -300,23 +296,6 @@ impl Config {
         )?)?)
     }
 
-    pub fn read_optional_gpu_selection(
-        &self,
-        name: &str,
-        gpu_id: u32,
-    ) -> Result<Option<Selection>> {
-        let file = if gpu_id == 0 {
-            format!("{name}.json")
-        } else {
-            format!("gpu{gpu_id}-{name}.json")
-        };
-        match std::fs::read(self.state_dir.join(file)) {
-            Ok(data) => Ok(Some(serde_json::from_slice(&data)?)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
     pub fn save_gpu_selection(&self, name: &str, selection: &Selection) -> Result<()> {
         let file = if selection.gpu_id == 0 {
             format!("{name}.json")
@@ -358,12 +337,7 @@ impl Config {
         if !file.exists() {
             return Ok(GpuMode::Normal);
         }
-        let mode: GpuMode = serde_json::from_slice(&std::fs::read(file)?)?;
-        if mode == GpuMode::Throttle {
-            self.save_gpu_mode(gpu_id, GpuMode::Normal)?;
-            return Ok(GpuMode::Normal);
-        }
-        Ok(mode)
+        Ok(serde_json::from_slice(&std::fs::read(file)?)?)
     }
 
     pub fn save_gpu_mode(&self, gpu_id: u32, mode: GpuMode) -> Result<()> {
