@@ -1,6 +1,6 @@
 # GPU Pocket
 
-**停用安排（2026-11-06，北京时间）：项目正在归档至 GitHub，随后关闭本机、2-titan 和 zww 的全部 GPU Pocket 服务及自启动。执行结果、私有备份和恢复说明见 [停用记录](docs/SHUTDOWN.md)。下文部署状态为历史记录。**
+**已停用（2026-11-06，北京时间）：源码已归档至 GitHub，本机、2-titan 和 zww 的 GPU Pocket 后台功能与自启动均已关闭。手机 App 保留，远程功能不可用。执行结果、私有备份和恢复说明见 [停用记录](docs/SHUTDOWN.md)。下文部署状态为历史记录。**
 
 用于在手机监控 `2-titan`，并分别受控管理 `Tongji-Wang/gpu` 下 GPU0、GPU1 工作流的基础项目。手机端为 Flutter，服务器端为 Rust / Axum。
 
