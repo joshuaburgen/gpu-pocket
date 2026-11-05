@@ -78,6 +78,43 @@ pub struct CpuSelection {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct CpuPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub idle_start_enabled: bool,
+    #[serde(default)]
+    pub night_mode_enabled: bool,
+    #[serde(default = "default_cpu_idle_threshold_percent")]
+    pub idle_threshold_percent: u32,
+    #[serde(default = "default_cpu_idle_duration_minutes")]
+    pub idle_duration_minutes: u32,
+}
+
+impl Default for CpuPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_start_enabled: false,
+            night_mode_enabled: false,
+            idle_threshold_percent: default_cpu_idle_threshold_percent(),
+            idle_duration_minutes: default_cpu_idle_duration_minutes(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuMode {
+    #[default]
+    Normal,
+    IdleAuto,
+    Night,
+    ManualNight,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct GpuPolicy {
     pub gpu_id: u32,
     #[serde(default)]
@@ -104,6 +141,7 @@ pub enum GpuMode {
     Throttle,
     ManualThrottle,
     Night,
+    ManualNight,
 }
 
 fn default_host_name() -> String {
@@ -120,6 +158,14 @@ fn default_throttle_intensity() -> u32 {
 
 fn default_cpu_threads_percent() -> u32 {
     50
+}
+
+fn default_cpu_idle_threshold_percent() -> u32 {
+    25
+}
+
+fn default_cpu_idle_duration_minutes() -> u32 {
+    10
 }
 
 impl GpuPolicy {
@@ -267,7 +313,7 @@ impl Config {
         self.save_json(name, selection)
     }
 
-    fn save_json<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
+    pub(crate) fn save_json<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
         std::fs::create_dir_all(&self.state_dir)?;
         let temp = self.state_dir.join(format!(".{name}.tmp"));
         let mut options = std::fs::OpenOptions::new();
@@ -313,6 +359,41 @@ impl Config {
 
     pub fn save_cpu_selection(&self, name: &str, selection: &CpuSelection) -> Result<()> {
         self.save_json(&format!("cpu-{name}.json"), selection)
+    }
+
+    pub fn read_cpu_policy(&self) -> Result<CpuPolicy> {
+        let file = self.state_dir.join("cpu-policy.json");
+        if !file.exists() {
+            return Ok(CpuPolicy::default());
+        }
+        let policy: CpuPolicy = serde_json::from_slice(&std::fs::read(file)?)?;
+        if !(1..=100).contains(&policy.idle_threshold_percent)
+            || !(1..=1440).contains(&policy.idle_duration_minutes)
+        {
+            bail!("invalid CPU automation policy");
+        }
+        Ok(policy)
+    }
+
+    pub fn save_cpu_policy(&self, policy: &CpuPolicy) -> Result<()> {
+        if !(1..=100).contains(&policy.idle_threshold_percent)
+            || !(1..=1440).contains(&policy.idle_duration_minutes)
+        {
+            bail!("CPU idle threshold must be 1..100 and duration 1..1440 minutes");
+        }
+        self.save_json("cpu-policy.json", policy)
+    }
+
+    pub fn read_cpu_mode(&self) -> Result<CpuMode> {
+        let file = self.state_dir.join("cpu-mode.json");
+        if !file.exists() {
+            return Ok(CpuMode::Normal);
+        }
+        Ok(serde_json::from_slice(&std::fs::read(file)?)?)
+    }
+
+    pub fn save_cpu_mode(&self, mode: CpuMode) -> Result<()> {
+        self.save_json("cpu-mode.json", &mode)
     }
 
     pub fn read_gpu_policy(&self, gpu_id: u32) -> Result<GpuPolicy> {

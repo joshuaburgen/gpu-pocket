@@ -7,12 +7,15 @@ import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'api.dart';
+import 'ai_tasks.dart';
+import 'manual_night.dart';
 import 'wallet_accounts.dart';
 
 void main() => runApp(const GpuPocketApp());
 
 Color? activeGpuModeColor(String? service, String? mode) {
   if (service != 'active') return null;
+  if (mode == 'manual_night') return Colors.lightBlueAccent;
   return mode == 'throttle' || mode == 'manual_throttle'
       ? Colors.purpleAccent
       : Colors.green;
@@ -84,7 +87,6 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
   final _token2 = TextEditingController();
   final _sharedPoolId = TextEditingController();
   final _sharedWallet = TextEditingController();
-  final _aiTask = TextEditingController();
   String? _sharedGpuProfileId;
   String? _sharedCpuProfileId;
   String? _sharedWalletPreset;
@@ -760,12 +762,23 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _cpuMiner2(String operation) async {
+  Future<void> _cpuMiner2(String operation, {String mode = 'normal'}) async {
     if (!_enabled2) return;
     try {
+      if (!await _confirm(
+        mode == 'manual_night' ? '启动 zww CPU 手动深夜' : '控制 zww CPU 矿工',
+        mode == 'manual_night'
+            ? '使用已暂存的线程比例，到北京时间 08:00 自动停止。SRBMiner 线程比例不是系统级 CPU 限额。'
+            : operation == 'stop'
+            ? '停止 CPU 矿工。'
+            : '应用已暂存的 CPU 配置并启动矿工。',
+      )) {
+        return;
+      }
       await _api2!.request('POST', '/api/v1/cpu/miner', {
         'operation': operation,
         'revision': _cpuRevision2,
+        if (operation != 'stop') 'mode': mode,
       });
       await _refreshSecond();
     } catch (e) {
@@ -773,21 +786,28 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _cpuMiner(String operation) async {
+  Future<void> _cpuMiner(String operation, {String mode = 'normal'}) async {
     if (!_enabled) return;
     final selected =
         (_status?['cpu_mining'] as JsonMap?)?['desired'] as JsonMap?;
-    final details = operation == 'stop'
+    final details = mode == 'manual_night'
+        ? 'CPU 将使用已暂存配置运行到北京时间 08:00，并在到时自动停止。线程比例不是系统级 CPU 限额。'
+        : operation == 'stop'
         ? '停止 GPU Pocket 管理的 CPU 矿工。'
         : '应用 CPU 配置：\n算法：${selected?['profile_id']}\n矿池：${selected?['pool_id']}\n线程比例：${selected?['threads_percent'] ?? 50}%\n此比例是 SRBMiner 线程提示，不是严格的系统级 CPU 限额。';
     if (await _confirm(
-      operation == 'stop' ? '停止 CPU 矿工' : '应用并启动 CPU 矿工',
+      mode == 'manual_night'
+          ? '启动 CPU 手动深夜模式'
+          : operation == 'stop'
+          ? '停止 CPU 矿工'
+          : '应用并启动 CPU 矿工',
       details,
     )) {
       await _mutate((api) async {
         await api.request('POST', '/api/v1/cpu/miner', {
           'operation': operation,
           'revision': _cpuRevision,
+          if (operation != 'stop') 'mode': mode,
         });
       });
     }
@@ -830,7 +850,6 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     _token2.dispose();
     _sharedPoolId.dispose();
     _sharedWallet.dispose();
-    _aiTask.dispose();
     for (final draft in [..._gpuDrafts.values, ..._gpuDrafts2.values]) {
       draft.dispose();
     }
@@ -982,7 +1001,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       : '—';
 
   String _idleDuration(dynamic value) {
-    if (value is! num) return '未空闲';
+    if (value is! num) return '未计时';
     final seconds = value.round().clamp(0, 1 << 31);
     final hours = seconds ~/ 3600;
     final minutes = (seconds % 3600) ~/ 60;
@@ -993,8 +1012,21 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     return '${minutes.toString().padLeft(2, '0')}:${remainder.toString().padLeft(2, '0')}';
   }
 
+  String _cpuModeLabel(dynamic mode) => switch (mode) {
+    'idle_auto' => '低负载自启',
+    'night' => '自动深夜',
+    'manual_night' => '手动深夜',
+    _ => '手动/常规',
+  };
+
   Color _cpuOverviewColor(JsonMap cpu) {
     final service = cpu['service']?.toString();
+    if (service == 'active' && cpu['mode'] == 'manual_night') {
+      return Colors.lightBlueAccent;
+    }
+    if (service == 'active' && cpu['mode'] == 'night') {
+      return Colors.cyanAccent;
+    }
     if (service == 'active') return Colors.green;
     if (service == 'failed' || service == 'unknown') return Colors.redAccent;
     return Colors.grey;
@@ -1027,7 +1059,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    'CPU $service · 使用率 ${usage is num ? '${usage.round()}%' : '采样中'} · 可控 ${selected ?? '—'}%',
+                    'CPU $service · ${_cpuModeLabel(cpu['mode'])} · 主机 ${usage is num ? '${usage.round()}%' : '采样中'} · 线程比例 ${selected ?? '—'}%',
                     style: TextStyle(
                       color: color == Colors.grey ? Colors.white70 : color,
                     ),
@@ -1069,6 +1101,13 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     final automatic = policy?['enabled'] == true;
     final service = control?['service']?.toString();
     final runningMode = policyEntry?['mode']?.toString();
+    final manualNightActive =
+        service == 'active' && runningMode == 'manual_night';
+    final catalog = second ? _catalog2 : _catalog;
+    final selectedProfile = _profileFor(
+      catalog,
+      (control?['desired'] as JsonMap?)?['profile_id'] as String?,
+    );
     final throttleActive =
         service == 'active' &&
         (runningMode == 'throttle' || runningMode == 'manual_throttle');
@@ -1154,7 +1193,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
             ),
             const SizedBox(height: 3),
             Text(
-              '当前空闲 ${_idleDuration(control?['idle_seconds'])}',
+              '空闲自启计时 ${_idleDuration(control?['idle_seconds'])}',
               style: const TextStyle(color: Colors.white60, fontSize: 12),
             ),
             if (service == 'failed' && control?['service_error'] is String)
@@ -1163,6 +1202,28 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                 child: Text(
                   '故障原因：${control!['service_error']}',
                   style: const TextStyle(color: Colors.redAccent, fontSize: 12),
+                ),
+              ),
+            if (gpuId != null)
+              ManualNightControl(
+                active: manualNightActive,
+                selected: runningMode == 'manual_night',
+                enabled: second ? _enabled2 : _enabled,
+                supported:
+                    catalog?['manual_night_supported'] == true &&
+                    selectedProfile?['miner'] == 'srb-pearl',
+                memoryBlocked:
+                    (policyEntry?['runtime'] as JsonMap?)?['memory_blocked'] ==
+                    true,
+                onStart: () => _manualNightAction(
+                  gpuId.toInt(),
+                  second: second,
+                  start: true,
+                ),
+                onStop: () => _manualNightAction(
+                  gpuId.toInt(),
+                  second: second,
+                  start: false,
                 ),
               ),
           ],
@@ -1201,6 +1262,45 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         child: content,
       ),
     );
+  }
+
+  Future<void> _manualNightAction(
+    int gpuId, {
+    required bool second,
+    required bool start,
+  }) async {
+    if (!(second ? _enabled2 : _enabled)) return;
+    final status = second ? _status2 : _status;
+    final control =
+        (status?['gpu_controls'] as JsonMap?)?[gpuId.toString()] as JsonMap?;
+    final desired = control?['desired'] as JsonMap?;
+    if (start && desired == null) return;
+    final entry =
+        (status?['policies'] as JsonMap?)?[gpuId.toString()] as JsonMap?;
+    final floor =
+        (entry?['policy'] as JsonMap?)?['min_free_memory_mib'] ?? 2048;
+    final operation = !start
+        ? 'stop'
+        : control?['service'] == 'active'
+        ? 'restart'
+        : 'start';
+    final details = start
+        ? 'GPU$gpuId 将按强度 31 启动手动深夜模式。\n忽略 Python、CARLA 等外部任务，可能导致双方性能下降或显存不足。\n保留 $floor MiB 可用显存保护，每约 5 秒检查，非显存硬上限。\n此模式独立于自动开关和深夜时段，需手动退出。'
+        : '停止 GPU$gpuId 的受管矿工并退出手动深夜模式。退出后，已开启的自动策略将恢复判断。';
+    if (!await _confirm(
+      start ? '手动深夜：GPU$gpuId 不避让启动' : '退出 GPU$gpuId 手动深夜',
+      details,
+    )) {
+      return;
+    }
+    final mutate = second ? _mutateSecond : _mutate;
+    await mutate((api) async {
+      await api.request('POST', '/api/v1/gpus/$gpuId/miner', {
+        'operation': operation,
+        'revision': desired?['revision'] ?? 0,
+        'mode': start ? 'manual_night' : 'normal',
+      });
+    });
   }
 
   Future<void> _quickGpuAction(int gpuId, {required bool second}) async {
@@ -1256,11 +1356,17 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
         ? 'restart'
         : 'start';
     final title = mode == 'stop' ? '停止 GPU$gpuId' : '启动 GPU$gpuId';
+    final externalPids = control?['external_pids'] as List?;
+    final sharingNotice = externalPids == null
+        ? '\n无法确认 GPU 上是否有其他计算任务；本次启动不会停止其他进程。'
+        : externalPids.isNotEmpty
+        ? '\n检测到 GPU 上已有计算任务 PID：${externalPids.join(', ')}。GPU Pocket 会与其共用显卡，不会停止该任务；可能出现显存不足或双方性能下降。'
+        : '';
     if (!await _confirm(
       title,
       mode == 'stop'
           ? '停止 GPU Pocket 管理的 GPU$gpuId 矿工。'
-          : '全量模式，SRBMiner 强度 31\\n算法：${desired['profile_id']}\\n矿池：${desired['pool_id']}\\n钱包：${desired['wallet']}\\n${operation == 'restart' ? '当前矿工将重启。' : '将启动矿工。'}',
+          : '全量模式，SRBMiner 强度 31\\n算法：${desired['profile_id']}\\n矿池：${desired['pool_id']}\\n钱包：${desired['wallet']}\\n${operation == 'restart' ? '当前矿工将重启。' : '将启动矿工。'}$sharingNotice',
     )) {
       return;
     }
@@ -1288,6 +1394,8 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     }
     var percent = (desired['threads_percent'] as num?)?.round() ?? 50;
     final service = cpu?['service']?.toString();
+    final mode = cpu?['mode']?.toString() ?? 'normal';
+    final manualNight = mode == 'manual_night';
     final result = await showDialog<Map<String, dynamic>>(
       context: context,
       builder: (context) => StatefulBuilder(
@@ -1322,10 +1430,23 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                 onPressed: () => Navigator.pop(context, {'operation': 'stop'}),
                 child: const Text('停止'),
               ),
+            FilledButton.tonal(
+              onPressed: () => Navigator.pop(context, {
+                'operation': manualNight
+                    ? 'stop'
+                    : service == 'active'
+                    ? 'restart'
+                    : 'start',
+                'percent': percent,
+                'mode': manualNight ? 'normal' : 'manual_night',
+              }),
+              child: Text(manualNight ? '退出手动深夜' : '手动深夜（至08:00）'),
+            ),
             FilledButton(
               onPressed: () => Navigator.pop(context, {
                 'operation': service == 'active' ? 'restart' : 'start',
                 'percent': percent,
+                'mode': 'normal',
               }),
               child: Text(service == 'active' ? '应用并重启' : '启动'),
             ),
@@ -1338,7 +1459,9 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     if (!await _confirm(
       operation == 'stop' ? '停止 CPU 矿工' : '应用 CPU 配置',
       operation == 'stop'
-          ? '停止 GPU Pocket 管理的 CPU 矿工。'
+          ? '停止 GPU Pocket 管理的 CPU 矿工并退出手动深夜模式。'
+          : result['mode'] == 'manual_night'
+          ? '启动 CPU 手动深夜模式，使用线程比例 ${result['percent']}%。将在北京时间 08:00 自动停止。该线程比例不是系统级 CPU 限额。'
           : '线程比例：${result['percent']}%\\n算法：${desired['profile_id']}\\n矿池：${desired['pool_id']}',
     )) {
       return;
@@ -1360,6 +1483,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       await api.request('POST', '/api/v1/cpu/miner', {
         'operation': operation,
         'revision': revision,
+        if (operation != 'stop') 'mode': result['mode'] ?? 'normal',
       });
     });
   }
@@ -1595,6 +1719,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     final draft = _cpuDraft2;
     final cpu = _status2?['cpu_mining'] as JsonMap?;
     final service = cpu?['service'] ?? 'unknown';
+    final manualNight = cpu?['mode'] == 'manual_night';
     return Card(
       margin: const EdgeInsets.only(top: 18),
       child: Padding(
@@ -1647,8 +1772,26 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                   onPressed: _enabled2 ? () => _cpuMiner2('stop') : null,
                   child: const Text('停止 CPU'),
                 ),
+                OutlinedButton.icon(
+                  onPressed: _enabled2
+                      ? manualNight
+                            ? () => _cpuMiner2('stop')
+                            : () => _cpuMiner2(
+                                service == 'active' ? 'restart' : 'start',
+                                mode: 'manual_night',
+                              )
+                      : null,
+                  icon: Icon(
+                    manualNight
+                        ? Icons.stop_circle_outlined
+                        : Icons.nightlight_round,
+                  ),
+                  label: Text(manualNight ? '退出手动深夜' : '手动深夜（至08:00）'),
+                ),
               ],
             ),
+            const SizedBox(height: 12),
+            _cpuAutomationControls(cpu, second: true),
           ],
         ),
       ),
@@ -1660,6 +1803,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     final cpuProfiles = _cpuProfiles;
     final cpu = _status?['cpu_mining'] as JsonMap?;
     final service = cpu?['service'] ?? 'unknown';
+    final manualNight = cpu?['mode'] == 'manual_night';
     final desired = cpu?['desired'] as JsonMap?;
     final canStage =
         _enabled &&
@@ -1681,7 +1825,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
             ),
             const SizedBox(height: 8),
             const Text(
-              '独立于 GPU0 / GPU1。默认线程比例 50%，可调至 1–100%；这是 SRBMiner 的线程提示，不是严格 CPU 硬限额。',
+              '独立于 GPU0 / GPU1。默认线程比例 50%，可调至 1–100%；这是工作线程数提示，不是当前 CPU 占用率或整机硬限额。矿池未连接时，CPU 不会产生持续的挖矿负载。',
               style: TextStyle(color: Colors.white60),
             ),
             if (cpuProfiles.isEmpty)
@@ -1739,6 +1883,30 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
                 ),
               ],
             ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _enabled
+                      ? manualNight
+                            ? () => _cpuMiner('stop')
+                            : () => _cpuMiner(
+                                service == 'active' ? 'restart' : 'start',
+                                mode: 'manual_night',
+                              )
+                      : null,
+                  icon: Icon(
+                    manualNight
+                        ? Icons.stop_circle_outlined
+                        : Icons.nightlight_round,
+                  ),
+                  label: Text(manualNight ? '退出手动深夜' : '手动深夜（至08:00）'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            _cpuAutomationControls(cpu),
             if (cpu?['active'] is Map)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
@@ -1749,6 +1917,72 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _cpuAutomationControls(JsonMap? cpu, {bool second = false}) {
+    final policy = cpu?['policy'] as JsonMap? ?? const <String, dynamic>{};
+    final enabled = second ? _enabled2 : _enabled;
+    final automatic = policy['enabled'] == true;
+    final idleStart = policy['idle_start_enabled'] == true;
+    final night = policy['night_mode_enabled'] == true;
+
+    Future<void> save({
+      bool? nextEnabled,
+      bool? nextIdleStart,
+      bool? nextNight,
+    }) async {
+      if (!enabled) return;
+      final mutate = second ? _mutateSecond : _mutate;
+      await mutate((api) async {
+        await api.request('PUT', '/api/v1/cpu/policy', {
+          'enabled': nextEnabled ?? automatic,
+          'idle_start_enabled': nextIdleStart ?? idleStart,
+          'night_mode_enabled': nextNight ?? night,
+          'idle_threshold_percent': policy['idle_threshold_percent'] ?? 25,
+          'idle_duration_minutes': policy['idle_duration_minutes'] ?? 10,
+        });
+      });
+    }
+
+    final runtime = cpu?['runtime'] as JsonMap?;
+    final seconds = runtime?['low_usage_seconds'];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Divider(),
+        Text(
+          'CPU 自动控制 · 当前 ${_cpuModeLabel(cpu?['mode'])}',
+          style: Theme.of(context).textTheme.titleSmall,
+        ),
+        const Text(
+          '空闲自启：整机 CPU 使用率低于 25% 连续 10 分钟后启动。深夜模式：北京时间 01:00 启动，08:00 自动停止。线程比例是矿工提示，不是系统级 CPU 限额。',
+          style: TextStyle(color: Colors.white60, fontSize: 12),
+        ),
+        if (seconds is num && idleStart)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text('低负载计时：${_idleDuration(seconds)}'),
+          ),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('启用 CPU 自动控制'),
+          value: automatic,
+          onChanged: enabled ? (value) => save(nextEnabled: value) : null,
+        ),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('低负载自动启动'),
+          value: idleStart,
+          onChanged: enabled ? (value) => save(nextIdleStart: value) : null,
+        ),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('自动深夜模式（01:00–08:00）'),
+          value: night,
+          onChanged: enabled ? (value) => save(nextNight: value) : null,
+        ),
+      ],
     );
   }
 
@@ -2021,7 +2255,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       ),
       const SizedBox(height: 6),
       const Text(
-        '全量启动和自启使用 SRBMiner 强度 31。自启会在 GPU 利用率低于 5% 持续 30 分钟后启动。手动节制启动已暂停：算法强度不限制 GPU 利用率或功耗。深夜模式按可用显存阈值保护，显存检查每 5 秒一次。',
+        '全量启动和自启使用 SRBMiner 强度 31。自启会在 GPU 利用率低于 25% 持续 10 分钟后启动。手动节制启动已暂停：算法强度不限制 GPU 利用率或功耗。深夜模式按可用显存阈值保护，显存检查每 5 秒一次。',
         style: TextStyle(color: Colors.white60),
       ),
       if (runtime?['message'] is String)
@@ -2042,7 +2276,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
       ),
       SwitchListTile(
         contentPadding: EdgeInsets.zero,
-        title: const Text('自启模式：低于 5% 持续 30 分钟后启动'),
+        title: const Text('自启模式：低于 25% 持续 10 分钟后启动'),
         subtitle: throttleAvailable
             ? null
             : const Text('需要选择 SRBMiner Pearl 算法'),
@@ -2116,6 +2350,9 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
     JsonMap? runtime, [
     String? runningMode,
   ]) {
+    if (runningMode == 'manual_night') {
+      return runtime?['memory_blocked'] == true ? '手动深夜：显存保护暂停' : '手动深夜（独立控制）';
+    }
     if (runningMode == 'manual_throttle') return '手动节制运行中';
     if (runtime?['memory_blocked'] == true) return '显存保护暂停';
     if (runtime?['external_task'] == true) return '外部任务保护';
@@ -2227,64 +2464,7 @@ class _ConsoleState extends State<Console> with WidgetsBindingObserver {
   }
 
   List<Widget> _aiTasks() => [
-    _heading('AI任务', '向本机开发 AI 助手布置 GPU Pocket 项目任务。'),
-    Card(
-      color: const Color(0xFF20292E),
-      child: Padding(
-        padding: const EdgeInsets.all(18),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Row(
-              children: [
-                Icon(Icons.link_off, color: Colors.amber),
-                SizedBox(width: 10),
-                Text(
-                  '尚未连接本机 AI',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            const Text(
-              '当前 App 和项目没有提供本机 Copilot / VS Code Agent 的任务桥接 API。为避免把任意命令执行服务暴露到公网，任务提交暂不可用。',
-              style: TextStyle(color: Colors.white70),
-            ),
-            const SizedBox(height: 16),
-            const Text('默认工作目录', style: TextStyle(color: Colors.white60)),
-            const SelectableText(
-              r'D:\work\github\gpu-pocket',
-              style: TextStyle(fontFamily: 'monospace'),
-            ),
-            const SizedBox(height: 20),
-            TextField(
-              controller: _aiTask,
-              minLines: 3,
-              maxLines: 6,
-              decoration: const InputDecoration(
-                labelText: '任务描述',
-                hintText: '描述希望本机 AI 在 GPU Pocket 中完成的工作',
-              ),
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: null,
-                icon: const Icon(Icons.send),
-                label: const Text('连接本机 AI 后可提交'),
-              ),
-            ),
-            const SizedBox(height: 8),
-            TextButton.icon(
-              onPressed: () => setState(() => _tab = 3),
-              icon: const Icon(Icons.settings_outlined),
-              label: const Text('打开设置'),
-            ),
-          ],
-        ),
-      ),
-    ),
+    AiTasksPanel(api: _api, onOpenSettings: () => setState(() => _tab = 3)),
   ];
 
   List<Widget> _settings() => [

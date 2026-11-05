@@ -12,6 +12,10 @@ void main() {
       Colors.purpleAccent,
     );
     expect(activeGpuModeColor('active', 'normal'), Colors.green);
+    expect(
+      activeGpuModeColor('active', 'manual_night'),
+      Colors.lightBlueAccent,
+    );
     expect(activeGpuModeColor('inactive', 'throttle'), isNull);
   });
 
@@ -51,9 +55,10 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('AI任务').last);
     await tester.pumpAndSettle();
-    expect(find.text('尚未连接本机 AI'), findsOneWidget);
+    expect(find.text('请先在设置中连接第一台服务器'), findsOneWidget);
     expect(find.text(r'D:\work\github\gpu-pocket'), findsOneWidget);
-    expect(find.text('连接本机 AI 后可提交'), findsOneWidget);
+    expect(find.text('Codex'), findsOneWidget);
+    expect(find.text('提交任务'), findsOneWidget);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 }

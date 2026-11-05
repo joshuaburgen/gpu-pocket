@@ -8,12 +8,129 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "test-only-32-characters-abcdefghijk";
 
+#[tokio::test]
+async fn ai_tasks_require_online_provider_and_support_claim_cancel_and_persistence() {
+    let (app, dir) = fixture();
+    let submission = json!({"provider":"codex","prompt":"Explain GPU Pocket","allow_edits":false});
+    assert_eq!(
+        call(&app, "POST", "/api/v1/ai/tasks", submission.clone())
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let worker = json!({"worker_id":"desktop","providers":[{"id":"codex","available":true,"message":"ready"},{"id":"cursor","available":false,"message":"login required"}],"running_task_id":null});
+    assert_eq!(
+        call(&app, "POST", "/api/v1/ai/worker/poll", worker.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (code, created) = call(&app, "POST", "/api/v1/ai/tasks", submission.clone()).await;
+    assert_eq!(code, StatusCode::OK);
+    let id = created["task"]["id"].as_str().unwrap();
+    let (_, claim) = call(&app, "POST", "/api/v1/ai/worker/poll", worker.clone()).await;
+    assert_eq!(claim["task"]["id"], id);
+    assert_eq!(claim["task"]["allow_edits"], false);
+    let (_, retry) = call(&app, "POST", "/api/v1/ai/worker/poll", worker.clone()).await;
+    assert_eq!(retry["task"]["id"], id);
+    let mut heartbeat = worker.clone();
+    heartbeat["running_task_id"] = json!(id);
+    let (_, running) = call(&app, "POST", "/api/v1/ai/worker/poll", heartbeat.clone()).await;
+    assert!(running["task"].is_null());
+    assert_eq!(running["cancel"], false);
+    let mut other = worker.clone();
+    other["worker_id"] = json!("other");
+    assert_eq!(
+        call(&app, "POST", "/api/v1/ai/worker/poll", other).await.0,
+        StatusCode::CONFLICT
+    );
+    call(
+        &app,
+        "POST",
+        &format!("/api/v1/ai/tasks/{id}/cancel"),
+        json!({}),
+    )
+    .await;
+    let (_, cancelling) = call(&app, "POST", "/api/v1/ai/worker/poll", heartbeat).await;
+    assert_eq!(cancelling["cancel"], true);
+    let result = json!({"worker_id":"desktop","id":id,"status":"completed","output":"result"});
+    assert_eq!(
+        call(&app, "POST", "/api/v1/ai/worker/result", result.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&app, "POST", "/api/v1/ai/worker/result", result)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    *app.ai.lock().await = ai::AiState::load(dir.path()).unwrap();
+    let (_, status) = call(&app, "GET", "/api/v1/ai", Value::Null).await;
+    assert_eq!(status["tasks"][0]["status"], "cancelled");
+    assert_eq!(status["tasks"][0]["output"], "result");
+    assert_eq!(status["providers"][0]["available"], false);
+}
+
+#[tokio::test]
+async fn ai_queue_rejects_workspace_injection_and_unavailable_cursor() {
+    let (app, _dir) = fixture();
+    let worker = json!({"worker_id":"desktop","providers":[{"id":"codex","available":true,"message":"ready"}],"running_task_id":null});
+    call(&app, "POST", "/api/v1/ai/worker/poll", worker).await;
+    let injection = json!({"provider":"codex","prompt":"test","workspace":"C:/Windows"});
+    assert_eq!(
+        call(&app, "POST", "/api/v1/ai/tasks", injection).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/api/v1/ai/tasks",
+            json!({"provider":"cursor","prompt":"test"})
+        )
+        .await
+        .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    for _ in 0..4 {
+        assert_eq!(
+            call(
+                &app,
+                "POST",
+                "/api/v1/ai/tasks",
+                json!({"provider":"codex","prompt":"test"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/api/v1/ai/tasks",
+            json!({"provider":"codex","prompt":"test"})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+}
+
 fn fixture() -> (App, tempfile::TempDir) {
+    fixture_with_control(true)
+}
+
+fn fixture_with_control(control_enabled: bool) -> (App, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
     config.state_dir = dir.path().to_path_buf();
-    config.control_enabled = true;
+    config.control_enabled = control_enabled;
     let app = App {
+        ai: Arc::new(Mutex::new(ai::AiState::default())),
         config: Arc::new(config),
         token: Arc::new(TOKEN.into()),
         demo: true,
@@ -24,6 +141,7 @@ fn fixture() -> (App, tempfile::TempDir) {
         runtime: Arc::new(Mutex::new(BTreeMap::new())),
         process_watch: Arc::new(Mutex::new(ProcessWatchState::default())),
         cpu_usage: Arc::new(Mutex::new(None)),
+        cpu_runtime: Arc::new(Mutex::new(CpuRuntime::default())),
         push: Arc::new(crate::push::PushService::new(
             dir.path().to_path_buf(),
             reqwest::Client::new(),
@@ -61,6 +179,8 @@ async fn all_routes_require_authentication() {
         ("POST", "/api/v1/miner"),
         ("PUT", "/api/v1/cpu/selection"),
         ("POST", "/api/v1/cpu/miner"),
+        ("GET", "/api/v1/cpu/policy"),
+        ("PUT", "/api/v1/cpu/policy"),
         ("PUT", "/api/v1/gpus/0/selection"),
         ("POST", "/api/v1/gpus/1/miner"),
         ("GET", "/api/v1/gpus/1/policy"),
@@ -68,6 +188,11 @@ async fn all_routes_require_authentication() {
         ("PUT", "/api/v1/push/token"),
         ("GET", "/api/v1/proxy"),
         ("PUT", "/api/v1/proxy"),
+        ("GET", "/api/v1/ai"),
+        ("POST", "/api/v1/ai/tasks"),
+        ("POST", "/api/v1/ai/tasks/test/cancel"),
+        ("POST", "/api/v1/ai/worker/poll"),
+        ("POST", "/api/v1/ai/worker/result"),
     ] {
         let response = router(app.clone())
             .oneshot(
@@ -201,6 +326,30 @@ async fn stage_apply_conflict_and_stop() {
 }
 
 #[tokio::test]
+async fn status_uses_server_auto_start_timer_instead_of_starting_its_own() {
+    let (app, _dir) = fixture();
+    let since = Instant::now() - Duration::from_secs(AUTO_START_IDLE_SECONDS + 45);
+    app.runtime.lock().await.insert(
+        0,
+        RuntimeState {
+            low_util_since: Some(since),
+            ..RuntimeState::default()
+        },
+    );
+
+    let (status_code, status) = call(&app, "GET", "/api/v1/status", Value::Null).await;
+
+    assert_eq!(status_code, StatusCode::OK);
+    assert!(status["gpu_controls"]["0"]["idle_seconds"]
+        .as_u64()
+        .is_some_and(|seconds| seconds >= AUTO_START_IDLE_SECONDS + 45));
+    assert_eq!(
+        app.runtime.lock().await.get(&0).unwrap().low_util_since,
+        Some(since)
+    );
+}
+
+#[tokio::test]
 async fn cpu_mining_is_independent_and_defaults_to_half_threads() {
     let (app, _dir) = fixture();
     let (_, catalog) = call(&app, "GET", "/api/v1/catalog", Value::Null).await;
@@ -265,6 +414,108 @@ async fn cpu_mining_is_independent_and_defaults_to_half_threads() {
         StatusCode::OK
     );
     assert_eq!(cpu_service_state(&app).await.unwrap(), "inactive");
+}
+
+#[tokio::test]
+async fn cpu_policy_defaults_disabled_and_validates_idle_settings() {
+    let (app, _dir) = fixture();
+    let (code, status) = call(&app, "GET", "/api/v1/status", Value::Null).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(status["cpu_mining"]["policy"]["enabled"], false);
+    assert_eq!(status["cpu_mining"]["policy"]["idle_start_enabled"], false);
+    assert_eq!(status["cpu_mining"]["policy"]["night_mode_enabled"], false);
+    assert_eq!(status["cpu_mining"]["policy"]["idle_threshold_percent"], 25);
+    assert_eq!(status["cpu_mining"]["policy"]["idle_duration_minutes"], 10);
+    assert_eq!(status["cpu_mining"]["mode"], "normal");
+
+    let (code, saved) = call(
+        &app,
+        "PUT",
+        "/api/v1/cpu/policy",
+        json!({
+            "enabled":true,
+            "idle_start_enabled":true,
+            "night_mode_enabled":true,
+            "idle_threshold_percent":30,
+            "idle_duration_minutes":15
+        }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(saved["policy"]["idle_threshold_percent"], 30);
+    assert_eq!(
+        app.config.read_cpu_policy().unwrap().idle_duration_minutes,
+        15
+    );
+    assert_eq!(
+        call(
+            &app,
+            "PUT",
+            "/api/v1/cpu/policy",
+            json!({
+                "enabled":true,
+                "idle_start_enabled":true,
+                "night_mode_enabled":false,
+                "idle_threshold_percent":0,
+                "idle_duration_minutes":15
+            })
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn cpu_automatic_night_starts_and_stops_at_beijing_schedule() {
+    let (app, _dir) = fixture();
+    let selected = CpuSelection {
+        profile_id: "xmr-randomx".into(),
+        pool_id: "kryptex-us".into(),
+        wallet: "test.worker".into(),
+        threads_percent: 25,
+        revision: 1,
+    };
+    app.config.save_cpu_selection("desired", &selected).unwrap();
+    app.config.save_cpu_selection("applied", &selected).unwrap();
+    app.config
+        .save_cpu_policy(&CpuPolicy {
+            enabled: true,
+            night_mode_enabled: true,
+            ..CpuPolicy::default()
+        })
+        .unwrap();
+
+    let beijing_0200 = UNIX_EPOCH + Duration::from_secs(18 * 60 * 60);
+    cpu_policy_tick(&app, beijing_0200).await.unwrap();
+    assert_eq!(app.config.read_cpu_mode().unwrap(), CpuMode::Night);
+    assert!(app.demo_cpu_active.lock().await.is_some());
+
+    let beijing_0800 = UNIX_EPOCH + Duration::from_secs(0);
+    cpu_policy_tick(&app, beijing_0800).await.unwrap();
+    assert_eq!(app.config.read_cpu_mode().unwrap(), CpuMode::Normal);
+    assert!(app.demo_cpu_active.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn manual_cpu_night_stops_at_eight_when_automation_is_off() {
+    let (app, _dir) = fixture_with_control(false);
+    let selected = CpuSelection {
+        profile_id: "xmr-randomx".into(),
+        pool_id: "kryptex-us".into(),
+        wallet: "test.worker".into(),
+        threads_percent: 25,
+        revision: 1,
+    };
+    app.config.save_cpu_selection("desired", &selected).unwrap();
+    app.config.save_cpu_selection("applied", &selected).unwrap();
+    app.config.save_cpu_mode(CpuMode::ManualNight).unwrap();
+    *app.demo_cpu_active.lock().await = Some(selected);
+
+    let beijing_0800 = UNIX_EPOCH + Duration::from_secs(0);
+    cpu_policy_tick(&app, beijing_0800).await.unwrap();
+    assert_eq!(app.config.read_cpu_mode().unwrap(), CpuMode::Normal);
+    assert!(app.demo_cpu_active.lock().await.is_none());
 }
 
 #[tokio::test]
@@ -591,11 +842,16 @@ async fn manual_throttle_start_is_disabled_without_changing_gpu_mode() {
 }
 
 #[test]
-fn only_manual_throttle_mode_can_share_with_unmanaged_gpu_tasks() {
-    assert!(!requires_exclusive_gpu(GpuMode::Throttle, true));
-    assert!(requires_exclusive_gpu(GpuMode::Normal, true));
+fn manual_full_start_can_share_but_automatic_start_remains_exclusive() {
+    assert!(!requires_exclusive_gpu(GpuMode::Normal, true));
+    assert!(requires_exclusive_gpu(GpuMode::Throttle, true));
     assert!(requires_exclusive_gpu(GpuMode::Throttle, false));
     assert!(requires_exclusive_gpu(GpuMode::Night, false));
+    assert!(requires_exclusive_gpu(GpuMode::Night, true));
+    assert!(!requires_exclusive_gpu(GpuMode::ManualNight, true));
+    assert!(!is_automatic_mode(GpuMode::ManualNight));
+    assert!(!should_stop_for_external_task(GpuMode::ManualNight, true));
+    assert_eq!(srbminer_intensity(GpuMode::ManualNight, 1).unwrap(), 31);
 }
 
 #[test]
@@ -607,6 +863,7 @@ fn manual_throttle_is_persisted_separately_and_survives_automation_disable() {
             GpuMode::Throttle,
             GpuMode::Normal,
             true,
+            false,
         ),
         GpuMode::ManualThrottle
     );
@@ -617,6 +874,29 @@ fn manual_throttle_is_persisted_separately_and_survives_automation_disable() {
             GpuMode::Normal,
             GpuMode::Throttle,
             false,
+            false,
+        ),
+        GpuMode::Normal
+    );
+    assert_eq!(
+        mode_for_action(
+            Operation::Stop,
+            "active",
+            GpuMode::Normal,
+            GpuMode::ManualNight,
+            false,
+            false,
+        ),
+        GpuMode::ManualNight
+    );
+    assert_eq!(
+        mode_for_action(
+            Operation::Stop,
+            "active",
+            GpuMode::Normal,
+            GpuMode::ManualNight,
+            false,
+            true,
         ),
         GpuMode::Normal
     );
@@ -628,10 +908,16 @@ fn manual_throttle_is_persisted_separately_and_survives_automation_disable() {
     ));
     assert!(should_stop_for_external_task(GpuMode::Throttle, false));
     assert!(should_stop_for_external_task(GpuMode::Normal, true));
-    assert!(should_auto_start(true, 30 * 60, false));
-    assert!(!should_auto_start(true, 30 * 60, true));
-    assert!(!should_auto_start(false, 30 * 60, false));
-    assert!(!should_auto_start(true, 30 * 60 - 1, false));
+    assert!(should_auto_start(true, AUTO_START_IDLE_SECONDS, false));
+    assert!(!should_auto_start(true, AUTO_START_IDLE_SECONDS, true));
+    assert!(!should_auto_start(false, AUTO_START_IDLE_SECONDS, false));
+    assert!(!should_auto_start(true, AUTO_START_IDLE_SECONDS - 1, false));
+    assert!(should_track_auto_start_idle(true, Some(0.0), false));
+    assert!(!should_track_auto_start_idle(true, Some(4.99), true));
+    assert!(!should_track_auto_start_idle(false, Some(0.0), false));
+    assert!(should_track_auto_start_idle(true, Some(24.99), false));
+    assert!(!should_track_auto_start_idle(true, Some(25.0), false));
+    assert!(!should_track_auto_start_idle(true, None, false));
     assert_eq!(srbminer_intensity(GpuMode::ManualThrottle, 10).unwrap(), 10);
 }
 
@@ -666,6 +952,253 @@ fn beijing_night_schedule_has_inclusive_start_and_exclusive_end() {
     assert!(is_china_night(beijing(1, 0)).unwrap());
     assert!(is_china_night(beijing(7, 59)).unwrap());
     assert!(!is_china_night(beijing(8, 0)).unwrap());
+}
+
+#[tokio::test]
+async fn manual_night_stops_at_eight_even_when_automation_is_disabled() {
+    let (app, _dir) = fixture_with_control(false);
+    let selection = Selection {
+        gpu_id: 0,
+        profile_id: "pearl".into(),
+        pool_id: "sg".into(),
+        wallet: "test.worker".into(),
+        power_limit_w: None,
+        gpu_intensity: None,
+        revision: 1,
+    };
+    app.config
+        .save_gpu_selection("desired", &selection)
+        .unwrap();
+    app.config
+        .save_gpu_selection("applied", &selection)
+        .unwrap();
+    app.config.save_gpu_mode(0, GpuMode::ManualNight).unwrap();
+    app.demo_active.lock().await.insert(0, selection);
+
+    let beijing_0800 = UNIX_EPOCH + Duration::from_secs(8 * 60 * 60 + 86_400 - 8 * 60 * 60);
+    policy_tick_with_process_check_at(&app, &gpu::demo(), beijing_0800, |_| async {
+        panic!("expired manual night mode must not check external GPU processes");
+        #[allow(unreachable_code)]
+        Ok(Vec::new())
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(app.config.read_gpu_mode(0).unwrap(), GpuMode::Normal);
+    assert!(!app.demo_active.lock().await.contains_key(&0));
+}
+
+#[tokio::test]
+async fn manual_night_ignores_automation_and_external_tasks_during_night_window() {
+    let (app, _dir) = fixture();
+    let (code, _) = call(
+        &app,
+        "PUT",
+        "/api/v1/gpus/0/selection",
+        json!({"gpu_id":0,"profile_id":"pearl","pool_id":"sg","wallet":"test.worker","revision":0}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let mut policy = GpuPolicy::new(0);
+    app.config.save_gpu_policy(&policy).unwrap();
+    let start = json!({"operation":"restart","revision":1,"mode":"manual_night"});
+    let (code, response) = call(&app, "POST", "/api/v1/gpus/0/miner", start).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(response["mode"], "manual_night");
+    let mut gpus = gpu::demo();
+    gpus[0].utilization = Some(100.0);
+    let beijing_0200 = UNIX_EPOCH + Duration::from_secs(2 * 60 * 60 + 86_400 - 8 * 60 * 60);
+    for enabled in [false, true] {
+        policy.enabled = enabled;
+        policy.night_mode_enabled = enabled;
+        policy.external_task_monitor = true;
+        app.config.save_gpu_policy(&policy).unwrap();
+        policy_tick_with_process_check_at(&app, &gpus, beijing_0200, |_| async {
+            panic!("manual night must not inspect or yield to external processes");
+            #[allow(unreachable_code)]
+            Ok(Vec::new())
+        })
+        .await
+        .unwrap();
+        assert!(app.demo_active.lock().await.contains_key(&0));
+        assert_eq!(app.config.read_gpu_mode(0).unwrap(), GpuMode::ManualNight);
+    }
+    // An automatic action queued before manual takeover must not stop it later.
+    auto_action(&app, 0, Operation::Stop, GpuMode::Normal)
+        .await
+        .unwrap();
+    assert!(app.demo_active.lock().await.contains_key(&0));
+    auto_action(&app, 0, Operation::Restart, GpuMode::Night)
+        .await
+        .unwrap();
+    assert_eq!(app.config.read_gpu_mode(0).unwrap(), GpuMode::ManualNight);
+    policy.enabled = false;
+    app.config.save_gpu_policy(&policy).unwrap();
+    gpus[0].memory_used_mib = gpus[0].memory_total_mib;
+    policy_tick_with_process_check_at(&app, &gpus, beijing_0200, |_| async { Ok(Vec::new()) })
+        .await
+        .unwrap();
+    assert!(!app.demo_active.lock().await.contains_key(&0));
+    assert!(app.runtime.lock().await[&0].memory_blocked);
+    assert_eq!(app.config.read_gpu_mode(0).unwrap(), GpuMode::ManualNight);
+    // Free memory recovery must not restart a protected manual session.
+    policy_tick_with_process_check_at(&app, &gpu::demo(), beijing_0200, |_| async {
+        Ok(Vec::new())
+    })
+    .await
+    .unwrap();
+    assert!(!app.demo_active.lock().await.contains_key(&0));
+    assert_eq!(app.config.read_gpu_mode(0).unwrap(), GpuMode::ManualNight);
+    let (code, _) = call(
+        &app,
+        "POST",
+        "/api/v1/gpus/0/miner",
+        json!({"operation":"stop","revision":1}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(app.config.read_gpu_mode(0).unwrap(), GpuMode::Normal);
+    assert!(!app.config.read_gpu_policy(0).unwrap().enabled);
+}
+
+#[tokio::test]
+async fn manual_night_rejects_insufficient_memory_without_changing_mode_and_stops_on_missing_metrics(
+) {
+    let (app, _dir) = fixture();
+    call(
+        &app,
+        "PUT",
+        "/api/v1/gpus/0/selection",
+        json!({"gpu_id":0,"profile_id":"pearl","pool_id":"sg","wallet":"test.worker","revision":0}),
+    )
+    .await;
+    let mut policy = GpuPolicy::new(0);
+    policy.min_free_memory_mib = 16384;
+    app.config.save_gpu_policy(&policy).unwrap();
+    let start = json!({"operation":"start","revision":1,"mode":"manual_night"});
+    assert_eq!(
+        call(&app, "POST", "/api/v1/gpus/0/miner", start.clone())
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(app.config.read_gpu_mode(0).unwrap(), GpuMode::Normal);
+    assert!(!app.demo_active.lock().await.contains_key(&0));
+    policy.min_free_memory_mib = 2048;
+    app.config.save_gpu_policy(&policy).unwrap();
+    assert_eq!(
+        call(&app, "POST", "/api/v1/gpus/0/miner", start).await.0,
+        StatusCode::OK
+    );
+    let beijing_0200 = UNIX_EPOCH + Duration::from_secs(2 * 60 * 60 + 86_400 - 8 * 60 * 60);
+    policy_tick_with_process_check_at(&app, &[], beijing_0200, |_| async { Ok(Vec::new()) })
+        .await
+        .unwrap();
+    assert!(!app.demo_active.lock().await.contains_key(&0));
+    assert_eq!(app.config.read_gpu_mode(0).unwrap(), GpuMode::ManualNight);
+    assert!(app.runtime.lock().await[&0].memory_blocked);
+}
+
+#[tokio::test]
+async fn night_miner_yields_to_user_compute_processes() {
+    let (app, _dir) = fixture();
+    let mut policy = GpuPolicy::new(0);
+    policy.enabled = true;
+    policy.night_mode_enabled = true;
+    app.config.save_gpu_policy(&policy).unwrap();
+    let (code, _) = call(
+        &app,
+        "PUT",
+        "/api/v1/gpus/0/selection",
+        json!({"gpu_id":0,"profile_id":"pearl","pool_id":"sg","wallet":"test.worker","revision":0}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    auto_action(&app, 0, Operation::Start, GpuMode::Night)
+        .await
+        .unwrap();
+    assert!(app.demo_active.lock().await.contains_key(&0));
+    let mut gpus = gpu::demo();
+    gpus[0].utilization = Some(0.0);
+    policy_tick_with_process_check(&app, &gpus, |_| async { Ok(vec![12345]) })
+        .await
+        .unwrap();
+    assert!(!app.demo_active.lock().await.contains_key(&0));
+    assert!(app.runtime.lock().await[&0].external_task);
+    assert!(app.runtime.lock().await[&0].low_util_since.is_none());
+    policy_tick_with_process_check(&app, &gpus, |_| async { Ok(vec![12345]) })
+        .await
+        .unwrap();
+    assert!(!app.demo_active.lock().await.contains_key(&0));
+}
+
+#[tokio::test]
+async fn idle_policy_preserves_timer_and_starts_after_ten_minutes() {
+    let (app, _dir) = fixture();
+    let mut policy = GpuPolicy::new(0);
+    policy.enabled = true;
+    policy.throttle_enabled = true;
+    app.config.save_gpu_policy(&policy).unwrap();
+    let (code, _) = call(
+        &app,
+        "PUT",
+        "/api/v1/gpus/0/selection",
+        json!({"gpu_id":0,"profile_id":"pearl","pool_id":"sg","wallet":"test.worker","revision":0}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let mut gpus = gpu::demo();
+    gpus[0].utilization = Some(0.0);
+    policy_tick_with_gpus(&app, &gpus).await.unwrap();
+    assert!(app.runtime.lock().await[&0].low_util_since.is_some());
+    let since = Instant::now() - Duration::from_secs(AUTO_START_IDLE_SECONDS - 5);
+    app.runtime.lock().await.get_mut(&0).unwrap().low_util_since = Some(since);
+    gpus[0].utilization = Some(24.99);
+    policy_tick_with_gpus(&app, &gpus).await.unwrap();
+    assert_eq!(app.runtime.lock().await[&0].low_util_since, Some(since));
+    assert!(!app.demo_active.lock().await.contains_key(&0));
+    app.runtime.lock().await.get_mut(&0).unwrap().low_util_since =
+        Some(Instant::now() - Duration::from_secs(AUTO_START_IDLE_SECONDS));
+    policy_tick_with_gpus(&app, &gpus).await.unwrap();
+    assert!(app.demo_active.lock().await.contains_key(&0));
+    assert!(!app.demo_active.lock().await.contains_key(&1));
+    policy_tick_with_gpus(&app, &gpus).await.unwrap();
+    assert!(app.runtime.lock().await[&0].low_util_since.is_none());
+}
+
+#[tokio::test]
+async fn idle_policy_resets_timer_when_low_utilization_is_interrupted() {
+    let (app, _dir) = fixture();
+    let mut policy = GpuPolicy::new(0);
+    policy.enabled = true;
+    policy.throttle_enabled = true;
+    app.config.save_gpu_policy(&policy).unwrap();
+    for utilization in [Some(25.0), Some(90.0), None] {
+        let mut gpus = gpu::demo();
+        gpus[0].utilization = utilization;
+        app.runtime
+            .lock()
+            .await
+            .entry(0)
+            .or_default()
+            .low_util_since = Some(Instant::now() - Duration::from_secs(AUTO_START_IDLE_SECONDS));
+        policy_tick_with_gpus(&app, &gpus).await.unwrap();
+        assert!(app.runtime.lock().await[&0].low_util_since.is_none());
+    }
+    app.runtime
+        .lock()
+        .await
+        .entry(0)
+        .or_default()
+        .low_util_since = Some(Instant::now());
+    policy_tick_with_gpus(&app, &[]).await.unwrap();
+    assert!(app.runtime.lock().await[&0].low_util_since.is_none());
+    policy.throttle_enabled = false;
+    app.config.save_gpu_policy(&policy).unwrap();
+    let mut gpus = gpu::demo();
+    gpus[0].utilization = Some(0.0);
+    policy_tick_with_gpus(&app, &gpus).await.unwrap();
+    assert!(app.runtime.lock().await[&0].low_util_since.is_none());
 }
 
 #[tokio::test]

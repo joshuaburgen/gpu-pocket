@@ -1,3 +1,4 @@
+mod ai;
 mod config;
 mod gpu;
 mod push;
@@ -11,7 +12,7 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use config::{Config, CpuSelection, GpuMode, GpuPolicy, Selection};
+use config::{Config, CpuMode, CpuPolicy, CpuSelection, GpuMode, GpuPolicy, Selection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -23,6 +24,8 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
 const GPU_IDS: [u32; 2] = [0, 1];
+const AUTO_START_IDLE_SECONDS: u64 = 10 * 60;
+const AUTO_START_UTILIZATION_THRESHOLD: f64 = 25.0;
 
 #[derive(Clone)]
 struct App {
@@ -36,8 +39,10 @@ struct App {
     runtime: Arc<Mutex<BTreeMap<u32, RuntimeState>>>,
     process_watch: Arc<Mutex<ProcessWatchState>>,
     cpu_usage: Arc<Mutex<Option<(u64, u64)>>>,
+    cpu_runtime: Arc<Mutex<CpuRuntime>>,
     push: Arc<push::PushService>,
     client: reqwest::Client,
+    ai: Arc<Mutex<ai::AiState>>,
 }
 
 #[derive(Default)]
@@ -49,9 +54,16 @@ struct ProcessWatchState {
 #[derive(Default)]
 struct RuntimeState {
     low_util_since: Option<Instant>,
-    idle_since: Option<Instant>,
     external_task: bool,
     memory_blocked: bool,
+    last_message: Option<String>,
+}
+
+#[derive(Default)]
+struct CpuRuntime {
+    last_sample: Option<(u64, u64)>,
+    low_usage_since: Option<Instant>,
+    usage_percent: Option<u32>,
     last_message: Option<String>,
 }
 
@@ -87,12 +99,17 @@ async fn authorize(State(app): State<App>, request: Request, next: Next) -> Resp
 
 fn router(app: App) -> Router {
     Router::new()
+        .merge(ai::routes())
         .route("/api/v1/status", get(status))
         .route("/api/v1/catalog", get(catalog))
         .route("/api/v1/selection", put(save))
         .route("/api/v1/miner", post(action))
         .route("/api/v1/cpu/selection", put(save_cpu_selection))
         .route("/api/v1/cpu/miner", post(action_cpu))
+        .route(
+            "/api/v1/cpu/policy",
+            get(read_cpu_policy).put(save_cpu_policy),
+        )
         .route("/api/v1/gpus/{gpu_id}/selection", put(save_gpu))
         .route("/api/v1/gpus/{gpu_id}/miner", post(action_gpu))
         .route(
@@ -366,23 +383,14 @@ async fn status(State(app): State<App>) -> ApiResult {
                 .filter(|process| process.gpu_id == gpu_id)
                 .collect::<Vec<_>>()
         });
-        let has_external_or_process = external_pids.as_ref().is_some_and(|pids| !pids.is_empty())
-            || processes.as_ref().is_some_and(|items| !items.is_empty());
-        let gpu_utilization_low = gpus
-            .iter()
-            .find(|gpu| gpu.index == gpu_id)
-            .and_then(|gpu| gpu.utilization)
-            .is_some_and(|utilization| utilization < 5.0);
-        let idle_seconds = {
-            let mut runtime = app.runtime.lock().await;
-            let state = runtime.entry(gpu_id).or_default();
-            if gpu_utilization_low && !has_external_or_process {
-                let since = state.idle_since.get_or_insert_with(Instant::now);
-                Some(since.elapsed().as_secs())
-            } else {
-                state.idle_since = None;
-                None
-            }
+        let idle_seconds = if service == "active" {
+            None
+        } else {
+            app.runtime
+                .lock()
+                .await
+                .get(&gpu_id)
+                .and_then(|state| state.low_util_since.map(|since| since.elapsed().as_secs()))
         };
         gpu_controls.insert(
             gpu_id.to_string(),
@@ -467,11 +475,32 @@ async fn status(State(app): State<App>) -> ApiResult {
         None
     };
     let cpu_usage_percent = cpu_usage_percent(&app).await;
+    let cpu_policy = match app.config.read_cpu_policy() {
+        Ok(policy) => Some(policy),
+        Err(error) => {
+            errors.push(format!("CPU policy: {error}"));
+            None
+        }
+    };
+    let cpu_mode = match app.config.read_cpu_mode() {
+        Ok(mode) => Some(mode),
+        Err(error) => {
+            errors.push(format!("CPU mode: {error}"));
+            None
+        }
+    };
+    let cpu_runtime = app.cpu_runtime.lock().await;
+    let cpu_low_usage_seconds = cpu_runtime
+        .low_usage_since
+        .map(|since| since.elapsed().as_secs());
+    let cpu_runtime_message = cpu_runtime.last_message.clone();
     Ok(Json(
         json!({"host": app.config.host_name.clone(), "demo": app.demo, "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         "gpus": gpus, "service": service, "desired": desired, "active": active,
         "gpu_controls":gpu_controls,"policies":policies,
-        "cpu_mining":{"service":cpu_service,"service_error":cpu_service_error,"desired":cpu_desired,"active":cpu_active,"usage_percent":cpu_usage_percent},
+        "cpu_mining":{"service":cpu_service,"service_error":cpu_service_error,"desired":cpu_desired,"active":cpu_active,"usage_percent":cpu_usage_percent,
+            "policy":cpu_policy,"mode":cpu_mode,
+            "runtime":{"low_usage_seconds":cpu_low_usage_seconds,"message":cpu_runtime_message}},
         "push_configured":app.push.configured(),
         "control_enabled": app.config.control_enabled, "errors": errors}),
     ))
@@ -506,7 +535,7 @@ async fn catalog(State(app): State<App>) -> ApiResult {
         .map(|p| json!({"id":p.id,"label":p.label,"algorithm":p.algorithm,"pools":p.pools}))
         .collect();
     Ok(Json(
-        json!({"profiles": profiles,"cpu_profiles":cpu_profiles}),
+        json!({"profiles": profiles,"cpu_profiles":cpu_profiles,"manual_night_supported":true}),
     ))
 }
 
@@ -546,14 +575,69 @@ async fn save_cpu_selection(
     Ok(Json(json!({"selection":selected,"applied":false})))
 }
 
-async fn action_cpu(State(app): State<App>, Json(action): Json<Action>) -> ApiResult {
+async fn read_cpu_policy(State(app): State<App>) -> ApiResult {
+    let policy = app.config.read_cpu_policy()?;
+    let mode = app.config.read_cpu_mode()?;
+    let runtime = app.cpu_runtime.lock().await;
+    Ok(Json(json!({
+        "policy":policy,
+        "mode":mode,
+        "runtime":{
+            "low_usage_seconds":runtime.low_usage_since.map(|since| since.elapsed().as_secs()),
+            "usage_percent":runtime.usage_percent,
+            "message":runtime.last_message
+        }
+    })))
+}
+
+async fn save_cpu_policy(State(app): State<App>, Json(policy): Json<CpuPolicy>) -> ApiResult {
     writable(&app)?;
+    app.config.save_cpu_policy(&policy).map_err(bad)?;
+    Ok(Json(json!({"policy":app.config.read_cpu_policy()?})))
+}
+
+async fn action_cpu(State(app): State<App>, Json(action): Json<Action>) -> ApiResult {
+    let mode = match action.mode.unwrap_or(GpuMode::Normal) {
+        GpuMode::Normal => CpuMode::Normal,
+        GpuMode::ManualNight => CpuMode::ManualNight,
+        _ => return Err(bad("CPU miner mode must be normal or manual_night")),
+    };
+    apply_cpu_action(app, action, mode, true, false).await
+}
+
+async fn apply_cpu_action(
+    app: App,
+    action: Action,
+    requested_mode: CpuMode,
+    manual: bool,
+    exit_manual_night: bool,
+) -> ApiResult {
+    if manual {
+        writable(&app)?;
+    }
     let _guard = app.mutation.lock().await;
+    let current_mode = app.config.read_cpu_mode()?;
+    if !manual
+        && current_mode == CpuMode::ManualNight
+        && !exit_manual_night
+        && !(action.operation == Operation::Stop && requested_mode == CpuMode::ManualNight)
+    {
+        return Ok(Json(json!({"ok":true,"mode":current_mode,"skipped":true})));
+    }
     let selection = read_cpu_desired(&app)?;
     if selection.as_ref().map_or(0, |s| s.revision) != action.revision {
         return Err(ApiError(
             StatusCode::CONFLICT,
             "selection changed; refresh before applying".into(),
+        ));
+    }
+    if action.operation != Operation::Stop
+        && requested_mode == CpuMode::ManualNight
+        && !is_china_night(SystemTime::now())?
+    {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "manual CPU night mode can only start between Beijing 01:00 and 08:00".into(),
         ));
     }
     let operation = match action.operation {
@@ -570,6 +654,16 @@ async fn action_cpu(State(app): State<App>, Json(action): Json<Action>) -> ApiRe
             ensure_miner_binary(&app.config, &profile.binary)?;
         }
     }
+    let mode_to_apply = if action.operation == Operation::Stop {
+        if !manual && current_mode == CpuMode::ManualNight && !exit_manual_night {
+            CpuMode::ManualNight
+        } else {
+            CpuMode::Normal
+        }
+    } else {
+        requested_mode
+    };
+    app.config.save_cpu_mode(mode_to_apply)?;
     if app.demo {
         let mut active = app.demo_cpu_active.lock().await;
         if operation == "stop" {
@@ -603,8 +697,29 @@ async fn action_cpu(State(app): State<App>, Json(action): Json<Action>) -> ApiRe
     }
     tracing::info!(operation, "CPU miner control completed");
     Ok(Json(
-        json!({"ok":true,"operation":operation,"demo":app.demo}),
+        json!({"ok":true,"operation":operation,"mode":mode_to_apply,"demo":app.demo}),
     ))
+}
+
+async fn auto_cpu_action(
+    app: &App,
+    operation: Operation,
+    mode: CpuMode,
+    exit_manual_night: bool,
+) -> Result<()> {
+    let selection = read_cpu_desired(app)?.context("no staged CPU selection")?;
+    let action = Action {
+        operation,
+        revision: selection.revision,
+        mode: Some(match mode {
+            CpuMode::ManualNight => GpuMode::ManualNight,
+            _ => GpuMode::Normal,
+        }),
+    };
+    let _ = apply_cpu_action(app.clone(), action, mode, false, exit_manual_night)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+    Ok(())
 }
 
 fn writable(app: &App) -> std::result::Result<(), ApiError> {
@@ -748,6 +863,123 @@ async fn process_monitor_loop(app: App) {
     }
 }
 
+async fn cpu_policy_tick(app: &App, now: SystemTime) -> Result<()> {
+    let policy = app.config.read_cpu_policy()?;
+    let mode = app.config.read_cpu_mode()?;
+    let service = cpu_service_state(app).await?;
+    let in_night = is_china_night(now)?;
+
+    if mode == CpuMode::ManualNight {
+        if !in_night {
+            auto_cpu_action(app, Operation::Stop, CpuMode::ManualNight, true).await?;
+            let mut runtime = app.cpu_runtime.lock().await;
+            runtime.low_usage_since = None;
+            runtime.last_message = None;
+        }
+        return Ok(());
+    }
+
+    if !app.config.control_enabled {
+        return Ok(());
+    }
+
+    if !policy.enabled {
+        if service == "active" && matches!(mode, CpuMode::IdleAuto | CpuMode::Night) {
+            auto_cpu_action(app, Operation::Stop, CpuMode::Normal, false).await?;
+        }
+        app.cpu_runtime.lock().await.low_usage_since = None;
+        return Ok(());
+    }
+
+    if in_night && policy.night_mode_enabled {
+        if service != "active" || mode != CpuMode::Night {
+            auto_cpu_action(
+                app,
+                if service == "active" {
+                    Operation::Restart
+                } else {
+                    Operation::Start
+                },
+                CpuMode::Night,
+                false,
+            )
+            .await?;
+            notify_policy(
+                app,
+                0,
+                "GPU Pocket CPU 深夜模式",
+                "CPU 已按北京时间 01:00–08:00 启动深夜模式。",
+            )
+            .await;
+        }
+        app.cpu_runtime.lock().await.low_usage_since = None;
+        return Ok(());
+    }
+    if service == "active" && mode == CpuMode::Night {
+        auto_cpu_action(app, Operation::Stop, CpuMode::Normal, false).await?;
+        notify_policy(
+            app,
+            0,
+            "GPU Pocket CPU 深夜模式结束",
+            "CPU 深夜模式已到北京时间 08:00 自动停止。",
+        )
+        .await;
+        return Ok(());
+    }
+
+    let sample = read_cpu_usage().ok();
+    let usage = {
+        let mut runtime = app.cpu_runtime.lock().await;
+        let usage = sample.as_ref().and_then(|current| {
+            runtime.last_sample.and_then(|previous| {
+                let total_delta = current.total.saturating_sub(previous.0);
+                let idle_delta = current.idle.saturating_sub(previous.1);
+                100u64
+                    .saturating_mul(total_delta.saturating_sub(idle_delta))
+                    .checked_div(total_delta)
+                    .map(|percent| percent as u32)
+            })
+        });
+        runtime.last_sample = sample.map(|sample| (sample.total, sample.idle));
+        runtime.usage_percent = usage;
+        if service == "inactive"
+            && policy.idle_start_enabled
+            && usage.is_some_and(|usage| usage < policy.idle_threshold_percent)
+        {
+            let since = runtime.low_usage_since.get_or_insert_with(Instant::now);
+            Some(since.elapsed().as_secs())
+        } else {
+            runtime.low_usage_since = None;
+            None
+        }
+    };
+
+    let required_seconds = u64::from(policy.idle_duration_minutes) * 60;
+    if policy.idle_start_enabled
+        && service == "inactive"
+        && usage.is_some()
+        && app
+            .cpu_runtime
+            .lock()
+            .await
+            .low_usage_since
+            .is_some_and(|since| since.elapsed().as_secs() >= required_seconds)
+    {
+        auto_cpu_action(app, Operation::Start, CpuMode::IdleAuto, false).await?;
+        notify_policy(
+            app,
+            0,
+            "GPU Pocket CPU 空闲自启",
+            &format!(
+                "整机 CPU 使用率低于 {}% 已持续 {} 分钟，CPU 矿工已启动。",
+                policy.idle_threshold_percent, policy.idle_duration_minutes
+            ),
+        )
+        .await;
+    }
+    Ok(())
+}
+
 async fn process_monitor_tick(app: &App) -> Result<()> {
     if app.demo {
         return Ok(());
@@ -831,29 +1063,141 @@ async fn notify_policy(app: &App, gpu_id: u32, title: &str, body: &str) {
 }
 
 async fn auto_action(app: &App, gpu_id: u32, operation: Operation, mode: GpuMode) -> Result<()> {
+    auto_action_with_manual_night_exit(app, gpu_id, operation, mode, false).await
+}
+
+async fn auto_action_end_manual_night(app: &App, gpu_id: u32) -> Result<()> {
+    auto_action_with_manual_night_exit(app, gpu_id, Operation::Stop, GpuMode::ManualNight, true)
+        .await
+}
+
+async fn auto_action_with_manual_night_exit(
+    app: &App,
+    gpu_id: u32,
+    operation: Operation,
+    mode: GpuMode,
+    exit_manual_night: bool,
+) -> Result<()> {
     let selection = read_desired(app, gpu_id)?.context("no staged GPU selection")?;
     let action = Action {
         operation,
         revision: selection.revision,
         mode: Some(mode),
     };
-    let _ = action_for_gpu(app.clone(), gpu_id, action, mode, false)
+    let _ = action_for_gpu(app.clone(), gpu_id, action, mode, false, exit_manual_night)
         .await
         .map_err(|error| anyhow::anyhow!(error.1))?;
     Ok(())
 }
 
 async fn policy_tick(app: &App) -> Result<()> {
+    cpu_policy_tick(app, SystemTime::now()).await?;
     if !app.config.control_enabled {
-        return Ok(());
+        let mut manual_night_active = false;
+        for gpu_id in GPU_IDS {
+            manual_night_active |= app.config.read_gpu_mode(gpu_id)? == GpuMode::ManualNight;
+        }
+        if !manual_night_active {
+            return Ok(());
+        }
     }
-    let gpus = gpu::collect().await?;
-    let now = SystemTime::now();
+    let gpus = match gpu::collect().await {
+        Ok(gpus) => gpus,
+        Err(error) => {
+            // A failed nvidia-smi sample is also unknown memory, not permission
+            // to leave a manual night miner running without its memory guard.
+            policy_tick_with_gpus(app, &[]).await?;
+            return Err(error);
+        }
+    };
+    policy_tick_with_gpus(app, &gpus).await
+}
+
+async fn policy_tick_with_gpus(app: &App, gpus: &[gpu::Gpu]) -> Result<()> {
+    policy_tick_with_process_check(app, gpus, |gpu_id| async move {
+        if app.demo {
+            Ok(Vec::new())
+        } else {
+            gpu::unmanaged_compute_pids(gpu_id).await
+        }
+    })
+    .await
+}
+
+async fn policy_tick_with_process_check<F, Fut>(
+    app: &App,
+    gpus: &[gpu::Gpu],
+    check_processes: F,
+) -> Result<()>
+where
+    F: Fn(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u32>>>,
+{
+    policy_tick_with_process_check_at(app, gpus, SystemTime::now(), check_processes).await
+}
+
+async fn policy_tick_with_process_check_at<F, Fut>(
+    app: &App,
+    gpus: &[gpu::Gpu],
+    now: SystemTime,
+    check_processes: F,
+) -> Result<()>
+where
+    F: Fn(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u32>>>,
+{
     for gpu_id in GPU_IDS {
         let policy = app.config.read_gpu_policy(gpu_id)?;
         let service = service_state(app, gpu_id).await?;
         let current_mode = app.config.read_gpu_mode(gpu_id)?;
         let runtime_lock = app.runtime.clone();
+        if current_mode == GpuMode::ManualNight {
+            if !is_china_night(now)? {
+                auto_action_end_manual_night(app, gpu_id).await?;
+                {
+                    let mut runtime = runtime_lock.lock().await;
+                    let state = runtime.entry(gpu_id).or_default();
+                    state.low_util_since = None;
+                    state.external_task = false;
+                    state.memory_blocked = false;
+                    state.last_message = None;
+                }
+                notify_policy(
+                    app,
+                    gpu_id,
+                    "GPU Pocket 手动深夜模式结束",
+                    &format!("GPU{gpu_id} 手动深夜模式已到北京时间 08:00 自动停止。"),
+                )
+                .await;
+                continue;
+            }
+            let free_memory = gpus
+                .iter()
+                .find(|gpu| gpu.index == gpu_id)
+                .and_then(free_gpu_memory_mib);
+            let blocked = free_memory.is_none_or(|free| free < policy.min_free_memory_mib as f64);
+            {
+                let mut runtime = runtime_lock.lock().await;
+                let state = runtime.entry(gpu_id).or_default();
+                state.low_util_since = None;
+                state.external_task = false;
+                state.memory_blocked = blocked;
+                state.last_message = blocked.then(|| {
+                    format!(
+                        "手动深夜模式显存保护：可用显存低于 {} MiB 或无法采样，需要手动重新启动",
+                        policy.min_free_memory_mib
+                    )
+                });
+            }
+            if service == "active" && blocked {
+                auto_action(app, gpu_id, Operation::Stop, GpuMode::ManualNight).await?;
+                notify_policy(app, gpu_id, "GPU Pocket 手动深夜显存保护", &format!("GPU{gpu_id} 可用显存不足或无法采样，已停止手动深夜矿工；恢复后需手动重新启动。")).await;
+            }
+            continue;
+        }
+        if !app.config.control_enabled {
+            continue;
+        }
         if !policy.enabled {
             if service == "active" && is_automatic_mode(current_mode) {
                 if let Err(error) = auto_action(app, gpu_id, Operation::Stop, GpuMode::Normal).await
@@ -867,24 +1211,32 @@ async fn policy_tick(app: &App) -> Result<()> {
         }
 
         let Some(metrics) = gpus.iter().find(|gpu| gpu.index == gpu_id) else {
+            runtime_lock
+                .lock()
+                .await
+                .entry(gpu_id)
+                .or_default()
+                .low_util_since = None;
             continue;
         };
         let night = policy.night_mode_enabled && is_china_night(now)?;
-        let night_only_memory = night || current_mode == GpuMode::Night;
-        let monitor_external = !night_only_memory
-            && (policy.enabled && (policy.external_task_monitor || policy.throttle_enabled));
-        let unmanaged_result = if app.demo || !monitor_external {
+        let monitor_external = policy.external_task_monitor
+            || policy.throttle_enabled
+            || policy.night_mode_enabled
+            || is_automatic_mode(current_mode);
+        let unmanaged_result = if !monitor_external {
             Ok(Vec::new())
         } else {
-            gpu::unmanaged_compute_pids(gpu_id).await
+            check_processes(gpu_id).await
         };
         let unmanaged = match unmanaged_result {
             Ok(pids) => pids,
             Err(error) => {
                 {
                     let mut runtime = runtime_lock.lock().await;
-                    runtime.entry(gpu_id).or_default().last_message =
-                        Some(format!("进程归属检查失败：{error}"));
+                    let state = runtime.entry(gpu_id).or_default();
+                    state.low_util_since = None;
+                    state.last_message = Some(format!("进程归属检查失败：{error}"));
                 }
                 if service == "active"
                     && should_stop_for_external_task(current_mode, policy.external_task_monitor)
@@ -905,10 +1257,10 @@ async fn policy_tick(app: &App) -> Result<()> {
         let was_external = {
             let mut runtime = runtime_lock.lock().await;
             let state = runtime.entry(gpu_id).or_default();
-            state.low_util_since = None;
             let previous = state.external_task;
             state.external_task = external_task;
             if external_task {
+                state.low_util_since = None;
                 state.last_message = Some(format!("检测到 GPU{gpu_id} 外部进程：{unmanaged:?}"));
             } else if previous
                 || state
@@ -966,6 +1318,12 @@ async fn policy_tick(app: &App) -> Result<()> {
         }
 
         if current_mode == GpuMode::ManualThrottle {
+            runtime_lock
+                .lock()
+                .await
+                .entry(gpu_id)
+                .or_default()
+                .low_util_since = None;
             let free_memory = metrics
                 .memory_total_mib
                 .zip(metrics.memory_used_mib)
@@ -999,7 +1357,11 @@ async fn policy_tick(app: &App) -> Result<()> {
         let low_util_seconds = {
             let mut runtime = runtime_lock.lock().await;
             let state = runtime.entry(gpu_id).or_default();
-            if policy.throttle_enabled && metrics.utilization.is_some_and(|value| value < 5.0) {
+            if should_track_auto_start_idle(
+                policy.throttle_enabled,
+                metrics.utilization,
+                service == "active",
+            ) {
                 let since = state.low_util_since.get_or_insert_with(Instant::now);
                 since.elapsed().as_secs()
             } else {
@@ -1007,7 +1369,8 @@ async fn policy_tick(app: &App) -> Result<()> {
                 0
             }
         };
-        let automation_due = night || (policy.throttle_enabled && low_util_seconds >= 30 * 60);
+        let automation_due =
+            night || (policy.throttle_enabled && low_util_seconds >= AUTO_START_IDLE_SECONDS);
         let memory_guard_active = current_mode != GpuMode::Normal || automation_due;
         let mut memory_blocked = false;
         let mut memory_blocked_now = false;
@@ -1086,7 +1449,7 @@ async fn policy_tick(app: &App) -> Result<()> {
                 app,
                 gpu_id,
                 "GPU Pocket 自启模式",
-                &format!("GPU{gpu_id} 利用率低于 5% 已持续 30 分钟，已按全量强度 31 启动。"),
+                &format!("GPU{gpu_id} 利用率低于 {AUTO_START_UTILIZATION_THRESHOLD}% 已持续 10 分钟，已按全量强度 31 启动。"),
             )
             .await;
         }
@@ -1111,7 +1474,15 @@ enum Operation {
 }
 
 async fn action(State(app): State<App>, Json(action): Json<Action>) -> ApiResult {
-    action_for_gpu(app, 0, action, action.mode.unwrap_or(GpuMode::Normal), true).await
+    action_for_gpu(
+        app,
+        0,
+        action,
+        action.mode.unwrap_or(GpuMode::Normal),
+        true,
+        false,
+    )
+    .await
 }
 
 async fn action_gpu(
@@ -1125,6 +1496,7 @@ async fn action_gpu(
         action,
         action.mode.unwrap_or(GpuMode::Normal),
         true,
+        false,
     )
     .await
 }
@@ -1135,10 +1507,30 @@ async fn action_for_gpu(
     action: Action,
     mode: GpuMode,
     manual: bool,
+    exit_manual_night: bool,
 ) -> ApiResult {
-    writable(&app)?;
+    if manual {
+        writable(&app)?;
+    }
     let unit = unit_name(gpu_id).map_err(bad)?;
     let _guard = app.mutation.lock().await;
+    let current_mode = app.config.read_gpu_mode(gpu_id)?;
+    // Re-check after taking the mutation lock: a policy decision may have been
+    // queued before the user took manual control. Only a tagged memory stop is
+    // allowed to act automatically on a manual night session.
+    if !manual
+        && current_mode == GpuMode::ManualNight
+        && !exit_manual_night
+        && !(action.operation == Operation::Stop && mode == GpuMode::ManualNight)
+    {
+        tracing::info!(
+            gpu_id,
+            "skipped stale automation during manual night session"
+        );
+        return Ok(Json(
+            json!({"ok":true,"gpu_id":gpu_id,"mode":current_mode,"skipped":true}),
+        ));
+    }
     let selection = read_desired(&app, gpu_id)?;
     if selection.as_ref().map_or(0, |s| s.revision) != action.revision {
         return Err(ApiError(
@@ -1187,15 +1579,39 @@ async fn action_for_gpu(
         action.operation,
         &active,
         requested_mode,
-        app.config.read_gpu_mode(gpu_id)?,
+        current_mode,
         manual,
+        exit_manual_night,
     );
-    app.config.save_gpu_mode(gpu_id, mode_to_apply)?;
     if operation != "stop" {
         let s = selection
             .as_ref()
             .ok_or_else(|| bad("save a selection first"))?;
         let (profile, _) = app.config.resolve(s).map_err(bad)?;
+        if requested_mode == GpuMode::ManualNight {
+            if profile.miner != "srb-pearl" {
+                return Err(bad("manual night mode requires SRBMiner Pearl"));
+            }
+            let policy = app.config.read_gpu_policy(gpu_id)?;
+            let gpus = if app.demo {
+                gpu::demo()
+            } else {
+                gpu::collect().await?
+            };
+            let free_memory = gpus
+                .iter()
+                .find(|gpu| gpu.index == gpu_id)
+                .and_then(free_gpu_memory_mib);
+            if free_memory.is_none_or(|free| free < policy.min_free_memory_mib as f64) {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "手动深夜模式需要至少 {} MiB 可用显存，当前不足或无法采样",
+                        policy.min_free_memory_mib
+                    ),
+                ));
+            }
+        }
         if !app.demo {
             let path = app
                 .config
@@ -1211,13 +1627,14 @@ async fn action_for_gpu(
             ) {
                 return Err(bad("binary escaped gpu_root"));
             }
-            if requires_exclusive_gpu(mode, manual) {
+            if requires_exclusive_gpu(mode_to_apply, manual) {
                 gpu::ensure_gpu_owned(gpu_id)
                     .await
                     .map_err(|e| ApiError(StatusCode::CONFLICT, e.to_string()))?;
             }
         }
     }
+    app.config.save_gpu_mode(gpu_id, mode_to_apply)?;
     if app.demo {
         let mut active = app.demo_active.lock().await;
         if operation == "stop" {
@@ -1262,7 +1679,13 @@ async fn action_for_gpu(
 }
 
 fn requires_exclusive_gpu(mode: GpuMode, manual: bool) -> bool {
-    !manual || mode != GpuMode::Throttle
+    !manual || !matches!(mode, GpuMode::Normal | GpuMode::ManualNight)
+}
+
+fn free_gpu_memory_mib(gpu: &gpu::Gpu) -> Option<f64> {
+    gpu.memory_total_mib
+        .zip(gpu.memory_used_mib)
+        .map(|(total, used)| (total - used).max(0.0))
 }
 
 fn is_automatic_mode(mode: GpuMode) -> bool {
@@ -1274,7 +1697,17 @@ fn should_stop_for_external_task(mode: GpuMode, monitor_enabled: bool) -> bool {
 }
 
 fn should_auto_start(enabled: bool, low_util_seconds: u64, service_active: bool) -> bool {
-    enabled && low_util_seconds >= 30 * 60 && !service_active
+    enabled && low_util_seconds >= AUTO_START_IDLE_SECONDS && !service_active
+}
+
+fn should_track_auto_start_idle(
+    enabled: bool,
+    utilization: Option<f64>,
+    service_active: bool,
+) -> bool {
+    enabled
+        && !service_active
+        && utilization.is_some_and(|value| value < AUTO_START_UTILIZATION_THRESHOLD)
 }
 
 fn mode_for_action(
@@ -1283,9 +1716,14 @@ fn mode_for_action(
     requested_mode: GpuMode,
     current_mode: GpuMode,
     manual: bool,
+    exit_manual_night: bool,
 ) -> GpuMode {
     if operation == Operation::Stop {
-        GpuMode::Normal
+        if !manual && current_mode == GpuMode::ManualNight && !exit_manual_night {
+            GpuMode::ManualNight
+        } else {
+            GpuMode::Normal
+        }
     } else if operation == Operation::Restart || service != "active" {
         if manual && requested_mode == GpuMode::Throttle {
             GpuMode::ManualThrottle
@@ -1555,6 +1993,7 @@ async fn main() -> Result<()> {
         push_client.build()?,
     ));
     let app = App {
+        ai: Arc::new(Mutex::new(ai::AiState::load(&config.state_dir)?)),
         config: Arc::new(config),
         token: Arc::new(token),
         demo,
@@ -1565,6 +2004,7 @@ async fn main() -> Result<()> {
         runtime: Arc::new(Mutex::new(BTreeMap::new())),
         process_watch: Arc::new(Mutex::new(ProcessWatchState::default())),
         cpu_usage: Arc::new(Mutex::new(None)),
+        cpu_runtime: Arc::new(Mutex::new(CpuRuntime::default())),
         push,
         client,
     };

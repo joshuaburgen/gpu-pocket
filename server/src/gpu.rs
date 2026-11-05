@@ -358,7 +358,11 @@ Processes:
         ] {
             assert!(is_ignored_gpu_process(name), "{name}");
         }
-        for name in ["/usr/bin/python3", "/opt/miner/custom-worker"] {
+        for name in [
+            "/usr/bin/python3",
+            "/opt/CARLA/CarlaUE4-Linux-Shipping",
+            "/opt/miner/custom-worker",
+        ] {
             assert!(!is_ignored_gpu_process(name), "{name}");
         }
     }

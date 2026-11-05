@@ -14,7 +14,7 @@ API 令牌位于开发机项目的 `.local/connection.json` 的 `token` 字段�
 
 截至 2026-11-02，API 的 `control_enabled` 为 true；持有 API 令牌的 App 可执行已授权的矿工控制操作。Titan GPU0 为 active，GPU1 有独立外部进程，未被 GPU Pocket 接管。Quick Tunnel 是公网入口，所有 API 请求仍须携带令牌；不要公开令牌或将其写入 APK。Android release APK 已安装并启动，覆盖安装保留原有 App 数据。
 
-手机访问 Titan API 不需要加入 Tailscale：APK 默认地址与上方 Quick Tunnel 地址相同。该隧道运行在 Titan 上，只把公网 HTTPS 请求转发至 Titan 的 `127.0.0.1:8787`，并不会把当前 Windows 电脑接入 Cloudflare，也不会建立 Windows 远程操作通道。若以后要通过手机让 AI 操作 Windows，应先在 Windows 上实现只允许明确、有限操作的授权服务，再将该服务作为隧道目标；不要把 PowerShell、SSH 或任意命令执行端点直接暴露到公网。
+手机访问 Titan API 不需要加入 Tailscale：APK 默认地址与上方 Quick Tunnel 地址相同。该隧道运行在 Titan 上，只把公网 HTTPS 请求转发至 Titan 的 `127.0.0.1:8787`，不会把 Windows 电脑直接暴露到公网。自 2026-11-04 起，“AI任务”通过现有 API 的受鉴权队列中转，本机 Windows 工作进程主动领取任务并调用 Codex，结果经同一 API 返回手机；无需给 Windows 新开入口。此链路不提供任意 PowerShell、SSH 或调用者指定工作目录的端点，具体约束和当前 Cursor 限制见 [本机 AI](AI.md)。
 
 地址在 Quick Tunnel 进程重启后可能变化。不要因 App 连接失败而直接重启隧道；先检查当前地址。API 服务重启通常不改变隧道地址。
 
